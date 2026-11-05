@@ -2,6 +2,8 @@ package rpc
 
 import (
 	"context"
+	"errors"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -9,6 +11,7 @@ import (
 
 	"github.com/iamxvbaba/td/clock"
 	"github.com/iamxvbaba/td/tg"
+	"github.com/iamxvbaba/td/tgerr"
 	"go.uber.org/zap/zaptest"
 
 	appchannels "telesrv/internal/app/channels"
@@ -301,6 +304,33 @@ func TestChannelsEditPhotoReturnsServiceMessageUpdatesRPC(t *testing.T) {
 	}, zaptest.NewLogger(t), clock.System)
 	input := &tg.InputChannel{ChannelID: created.Channel.ID, AccessHash: created.Channel.AccessHash}
 
+	// Access hash mismatch must be rejected
+	if _, err := r.onChannelsEditPhoto(WithUserID(ctx, owner.ID), &tg.ChannelsEditPhotoRequest{
+		Channel: input,
+		Photo:   &tg.InputChatPhoto{ID: &tg.InputPhoto{ID: photo.ID, AccessHash: 999999}},
+	}); !tgerr.Is(err, "PHOTO_INVALID") {
+		t.Fatalf("channels.editPhoto with a wrong access hash err = %v, want PHOTO_INVALID", err)
+	}
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{err: domain.ErrPhotoInvalid, want: "PHOTO_INVALID"},
+		{err: errors.New("disk failure"), want: "INTERNAL_SERVER_ERROR"},
+	} {
+		files.ensureAvatarErr = tc.err
+		if _, err := r.onChannelsEditPhoto(WithUserID(ctx, owner.ID), &tg.ChannelsEditPhotoRequest{
+			Channel: input,
+			Photo:   &tg.InputChatPhoto{ID: &tg.InputPhoto{ID: photo.ID, AccessHash: photo.AccessHash}},
+		}); !tgerr.Is(err, tc.want) {
+			t.Fatalf("channels.editPhoto with EnsureAvatarPhoto error %v err = %v, want %s", tc.err, err, tc.want)
+		}
+	}
+	files.ensureAvatarErr = nil
+	if len(files.photos) != 1 {
+		t.Fatalf("rejected calls left %d photos, want only the message photo", len(files.photos))
+	}
+
 	setResult, err := r.onChannelsEditPhoto(WithUserID(ctx, owner.ID), &tg.ChannelsEditPhotoRequest{
 		Channel: input,
 		Photo:   &tg.InputChatPhoto{ID: &tg.InputPhoto{ID: photo.ID, AccessHash: photo.AccessHash}},
@@ -313,9 +343,31 @@ func TestChannelsEditPhotoReturnsServiceMessageUpdatesRPC(t *testing.T) {
 	if !ok {
 		t.Fatalf("set action = %T, want MessageActionChatEditPhoto", setAction)
 	}
+	// The message photo has no avatar sizes, so the channel gets a separate avatar photo and
+	// the message photo row stays as it was.
 	tgPhoto, ok := editPhoto.Photo.(*tg.Photo)
-	if !ok || tgPhoto.ID != photo.ID {
-		t.Fatalf("set action photo = %#v, want tg.Photo id %d", editPhoto.Photo, photo.ID)
+	if !ok || tgPhoto.ID == photo.ID {
+		t.Fatalf("set action photo = %#v, want a new avatar photo instead of %d", editPhoto.Photo, photo.ID)
+	}
+	avatarTypes := map[string]bool{}
+	for _, size := range tgPhoto.Sizes {
+		if size, ok := size.(*tg.PhotoSize); ok {
+			avatarTypes[size.Type] = true
+		}
+	}
+	if !avatarTypes["a"] || !avatarTypes["c"] {
+		t.Fatalf("set action photo sizes = %#v, want avatar sizes 'a' and 'c'", tgPhoto.Sizes)
+	}
+	if storedPhoto, found, err := files.GetPhoto(ctx, photo.ID); err != nil || !found || !reflect.DeepEqual(storedPhoto, photo) {
+		t.Fatalf("message photo = %+v found=%v err=%v, want unchanged %+v", storedPhoto, found, err, photo)
+	}
+
+	// Re-selecting the avatar photo keeps its id.
+	if _, err := r.onChannelsEditPhoto(WithUserID(ctx, owner.ID), &tg.ChannelsEditPhotoRequest{
+		Channel: input,
+		Photo:   &tg.InputChatPhoto{ID: &tg.InputPhoto{ID: tgPhoto.ID}},
+	}); !tgerr.Is(err, "CHAT_NOT_MODIFIED") {
+		t.Fatalf("channels.editPhoto with the current avatar err = %v, want CHAT_NOT_MODIFIED", err)
 	}
 
 	clearResult, err := r.onChannelsEditPhoto(WithUserID(ctx, owner.ID), &tg.ChannelsEditPhotoRequest{
@@ -328,6 +380,138 @@ func TestChannelsEditPhotoReturnsServiceMessageUpdatesRPC(t *testing.T) {
 	clearAction := requireChannelPhotoServiceAction(t, clearResult, created.Channel.ID)
 	if _, ok := clearAction.(*tg.MessageActionChatDeletePhoto); !ok {
 		t.Fatalf("clear action = %T, want MessageActionChatDeletePhoto", clearAction)
+	}
+}
+
+func TestChannelsEditPhotoChecksRightsBeforeDerivingAvatarRPC(t *testing.T) {
+	ctx := context.Background()
+	userStore := memory.NewUserStore()
+	owner, err := userStore.Create(ctx, domain.User{AccessHash: 93, Phone: "15550009103", FirstName: "Owner"})
+	if err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+	member, err := userStore.Create(ctx, domain.User{AccessHash: 94, Phone: "15550009104", FirstName: "Member"})
+	if err != nil {
+		t.Fatalf("create member: %v", err)
+	}
+	channelService := appchannels.NewService(memory.NewChannelStore())
+	created, err := channelService.CreateChannel(ctx, owner.ID, domain.CreateChannelRequest{
+		Title:         "Photo Rights RPC",
+		Megagroup:     true,
+		MemberUserIDs: []int64{member.ID},
+		Date:          1700001910,
+	})
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	files := &fakeFiles{}
+	photo := files.putPhoto(domain.Photo{
+		ID:         9911,
+		AccessHash: 9912,
+		DCID:       2,
+		Date:       1700001911,
+		Sizes: []domain.PhotoSize{
+			{Kind: domain.PhotoSizeKindStripped, Type: "i", Bytes: []byte{4, 5, 6}},
+			{Kind: domain.PhotoSizeKindDefault, Type: "m", W: 320, H: 240, Size: 4096},
+			{Kind: domain.PhotoSizeKindDefault, Type: "x", W: 800, H: 600, Size: 16384},
+		},
+	})
+	r := New(Config{}, Deps{
+		Users:    appusers.NewService(userStore),
+		Channels: channelService,
+		Files:    files,
+	}, zaptest.NewLogger(t), clock.System)
+	messagePhoto := func() *tg.InputChatPhoto {
+		return &tg.InputChatPhoto{ID: &tg.InputPhoto{ID: photo.ID, AccessHash: photo.AccessHash}}
+	}
+	bogusID := created.Channel.ID + 1000
+
+	for _, tc := range []struct {
+		name string
+		call func() (tg.UpdatesClass, error)
+		want string
+	}{
+		{
+			name: "member channels.editPhoto",
+			call: func() (tg.UpdatesClass, error) {
+				return r.onChannelsEditPhoto(WithUserID(ctx, member.ID), &tg.ChannelsEditPhotoRequest{
+					Channel: &tg.InputChannel{ChannelID: created.Channel.ID, AccessHash: created.Channel.AccessHash},
+					Photo:   messagePhoto(),
+				})
+			},
+			want: "CHAT_ADMIN_REQUIRED",
+		},
+		{
+			name: "member messages.editChatPhoto",
+			call: func() (tg.UpdatesClass, error) {
+				return r.onMessagesEditChatPhoto(WithUserID(ctx, member.ID), &tg.MessagesEditChatPhotoRequest{
+					ChatID: created.Channel.ID,
+					Photo:  messagePhoto(),
+				})
+			},
+			want: "CHAT_ADMIN_REQUIRED",
+		},
+		{
+			name: "bogus channels.editPhoto",
+			call: func() (tg.UpdatesClass, error) {
+				return r.onChannelsEditPhoto(WithUserID(ctx, owner.ID), &tg.ChannelsEditPhotoRequest{
+					Channel: &tg.InputChannel{ChannelID: bogusID, AccessHash: created.Channel.AccessHash},
+					Photo:   messagePhoto(),
+				})
+			},
+			want: "CHANNEL_INVALID",
+		},
+		{
+			name: "bogus messages.editChatPhoto",
+			call: func() (tg.UpdatesClass, error) {
+				return r.onMessagesEditChatPhoto(WithUserID(ctx, owner.ID), &tg.MessagesEditChatPhotoRequest{
+					ChatID: bogusID,
+					Photo:  messagePhoto(),
+				})
+			},
+			want: "CHANNEL_INVALID",
+		},
+	} {
+		if _, err := tc.call(); !tgerr.Is(err, tc.want) {
+			t.Fatalf("%s with a message photo err = %v, want %s", tc.name, err, tc.want)
+		}
+		if len(files.photos) != 1 {
+			t.Fatalf("%s left %d photos, want only the message photo", tc.name, len(files.photos))
+		}
+	}
+	if view, err := channelService.GetChannel(ctx, owner.ID, created.Channel.ID); err != nil || view.Channel.PhotoID != 0 {
+		t.Fatalf("channel photo after rejected calls = %d err=%v, want none", view.Channel.PhotoID, err)
+	}
+
+	setResult, err := r.onMessagesEditChatPhoto(WithUserID(ctx, owner.ID), &tg.MessagesEditChatPhotoRequest{
+		ChatID: created.Channel.ID,
+		Photo:  messagePhoto(),
+	})
+	if err != nil {
+		t.Fatalf("messages.editChatPhoto set: %v", err)
+	}
+	editPhoto, ok := requireChannelPhotoServiceAction(t, setResult, created.Channel.ID).(*tg.MessageActionChatEditPhoto)
+	if !ok {
+		t.Fatalf("set action = %#v, want MessageActionChatEditPhoto", editPhoto)
+	}
+	avatar, ok := editPhoto.Photo.(*tg.Photo)
+	if !ok || avatar.ID == photo.ID {
+		t.Fatalf("set action photo = %#v, want a new avatar photo instead of %d", editPhoto.Photo, photo.ID)
+	}
+	avatarTypes := map[string]bool{}
+	for _, size := range avatar.Sizes {
+		if size, ok := size.(*tg.PhotoSize); ok {
+			avatarTypes[size.Type] = true
+		}
+	}
+	if !avatarTypes["s"] || !avatarTypes["a"] || !avatarTypes["c"] {
+		t.Fatalf("set action photo sizes = %#v, want avatar sizes s, a and c", avatar.Sizes)
+	}
+	if storedPhoto, found, err := files.GetPhoto(ctx, photo.ID); err != nil || !found || !reflect.DeepEqual(storedPhoto, photo) {
+		t.Fatalf("message photo = %+v found=%v err=%v, want unchanged %+v", storedPhoto, found, err, photo)
+	}
+	if view, err := channelService.GetChannel(ctx, owner.ID, created.Channel.ID); err != nil || view.Channel.PhotoID != avatar.ID {
+		t.Fatalf("channel photo = %d err=%v, want avatar %d", view.Channel.PhotoID, err, avatar.ID)
 	}
 }
 
@@ -702,6 +886,19 @@ func TestChannelUsernameAndManagementRPC(t *testing.T) {
 	if err != nil || !updated {
 		t.Fatalf("update username = %v err %v, want true", updated, err)
 	}
+	// A channel that is still being created is checked with inputChannelEmpty.
+	for _, tc := range []struct {
+		name string
+		want bool
+	}{{"public_team", false}, {"fresh_team", true}} {
+		ok, err := r.onChannelsCheckUsername(WithUserID(ctx, owner.ID), &tg.ChannelsCheckUsernameRequest{
+			Channel:  &tg.InputChannelEmpty{},
+			Username: tc.name,
+		})
+		if err != nil || ok != tc.want {
+			t.Fatalf("check %q for a new channel = %v err %v, want %v", tc.name, ok, err, tc.want)
+		}
+	}
 	admined, err := r.onChannelsGetAdminedPublicChannels(WithUserID(ctx, owner.ID), &tg.ChannelsGetAdminedPublicChannelsRequest{})
 	if err != nil {
 		t.Fatalf("get admined public channels: %v", err)
@@ -926,8 +1123,9 @@ func TestChannelUsernameAndManagementRPC(t *testing.T) {
 	if _, err := r.onChannelsConvertToGigagroup(WithUserID(ctx, owner.ID), input); err != nil {
 		t.Fatalf("convert to gigagroup: %v", err)
 	}
-	// 建群服务消息（id=1）被保留为会话兜底 top message，不随创建者
-	// 历史一起删除；可删的是 seed 文本与 thread reply 两条。
+	// The group-creation service message (id=1) is kept as the dialog fallback top
+	// message and is not deleted with the creator's history; the deletable ones are
+	// the seed text and thread reply, two messages.
 	if affected, err := r.onChannelsDeleteParticipantHistory(WithUserID(ctx, owner.ID), &tg.ChannelsDeleteParticipantHistoryRequest{Channel: input, Participant: &tg.InputPeerUser{UserID: owner.ID, AccessHash: owner.AccessHash}}); err != nil || affected.PtsCount != 2 || affected.Pts == 0 || affected.Offset != 0 {
 		t.Fatalf("delete participant history = %+v err %v, want one bounded delete update for owner text and reply messages", affected, err)
 	}
@@ -1049,8 +1247,10 @@ func TestChannelUsernameAndManagementRPC(t *testing.T) {
 	if forumTopicsWithCreated.Count != 2 || len(forumTopicsWithCreated.Topics) != 2 || len(forumTopicsWithCreated.Messages) == 0 {
 		t.Fatalf("messages.getForumTopics with created topic = %+v, want General + created topic + root message", forumTopicsWithCreated)
 	}
-	// 回归:官方 web(telegram-tt 首屏 loadTopics)发 limit=500,超单页上限。服务端必须钳到上限正常返回,
-	// 而非报 LIMIT_INVALID(此前 web 端每次 getForumTopics 恒失败)。客户端据返回的 count 用 offset 翻页。
+	// Regression: official web (telegram-tt first-screen loadTopics) sends limit=500,
+	// above the single-page cap. The server must clamp to the cap and return normally,
+	// not error with LIMIT_INVALID (previously the web client's every getForumTopics
+	// failed). The client paginates with offset based on the returned count.
 	forumTopicsLargeLimit, err := r.onMessagesGetForumTopics(WithUserID(ctx, owner.ID), &tg.MessagesGetForumTopicsRequest{
 		Peer:  forumPeer,
 		Limit: 500,
@@ -1476,9 +1676,11 @@ func TestChannelUsernameAndManagementRPC(t *testing.T) {
 	if monoChat.Broadcast || !monoChat.Megagroup {
 		t.Fatalf("free monoforum kind = broadcast:%v megagroup:%v, want megagroup monoforum", monoChat.Broadcast, monoChat.Megagroup)
 	}
-	// 母广播频道收到 paid_messages_price(渲染 "Channel enabled Direct Messages");monoforum 首次
-	// 创建则收到 channelCreate 创建消息(渲染 "Direct messages were enabled in this channel."),
-	// 不再收 paid_messages_price——在 megagroup 里那会渲染成错误的"消息免费/设价"文案。
+	// The parent broadcast channel receives paid_messages_price (rendering "Channel
+	// enabled Direct Messages"); the monoforum, on first creation, receives a
+	// channelCreate creation message (rendering "Direct messages were enabled in this
+	// channel."), and no longer receives paid_messages_price -- in a megagroup that
+	// would render the wrong "messages free/price set" wording.
 	freeServices := paidMessagesPriceServicePeers(t, freeUpdates)
 	if price := freeServices[broadcast.ID]; price == nil || !price.BroadcastMessagesAllowed || price.Stars != 0 {
 		t.Fatalf("free parent direct messages action = %+v, want enabled stars=0", price)
@@ -1519,7 +1721,7 @@ func TestChannelUsernameAndManagementRPC(t *testing.T) {
 	if monoChat.Broadcast || !monoChat.Megagroup {
 		t.Fatalf("paid monoforum kind = broadcast:%v megagroup:%v, want megagroup monoforum", monoChat.Broadcast, monoChat.Megagroup)
 	}
-	// 价格变更只进母频道;monoforum 已存在,不再收任何服务消息(仍作为引用 chat 被同批下发)。
+	// The price change goes only to the parent channel; the monoforum already exists and receives no service message (it is still sent as a referenced chat in the same batch).
 	paidServices := paidMessagesPriceServicePeers(t, paidUpdates)
 	if price := paidServices[broadcast.ID]; price == nil || !price.BroadcastMessagesAllowed || price.Stars != maxChannelPaidMessageStars {
 		t.Fatalf("paid parent direct messages action = %+v, want enabled stars=%d", price, maxChannelPaidMessageStars)
@@ -1532,9 +1734,11 @@ func TestChannelUsernameAndManagementRPC(t *testing.T) {
 		t.Fatalf("disable direct messages after enable: %v", err)
 	}
 	disabledAfterEnableChats := disabledAfterEnableUpdates.(*tg.Updates).Chats
-	// 关闭后只下发母频道(linked_monoforum_id 被隐藏 → 客户端缓存里 monoforum 翻出 MonoforumDisabled
-	// 状态显示停用页脚);monoforum 自身不再随关闭重新下发(无新服务消息,且 broadcast_messages_allowed
-	// =false 时 linkedMonoforumForChannelState 也不再附带它)。
+	// After disable only the parent channel is sent (linked_monoforum_id is hidden →
+	// the client cache flips the monoforum into the MonoforumDisabled state showing
+	// the disabled footer); the monoforum itself is no longer re-sent on disable (no
+	// new service message, and linkedMonoforumForChannelState no longer attaches it
+	// when broadcast_messages_allowed=false).
 	if len(disabledAfterEnableChats) != 1 {
 		t.Fatalf("disable direct messages chats = %d, want parent only", len(disabledAfterEnableChats))
 	}
@@ -1545,7 +1749,7 @@ func TestChannelUsernameAndManagementRPC(t *testing.T) {
 	if _, ok := disabledParent.GetLinkedMonoforumID(); ok {
 		t.Fatalf("disable direct messages parent projected linked_monoforum_id, want hidden")
 	}
-	// 关闭只进母频道;monoforum 不再收服务消息(停用页脚靠客户端从隐藏的 linked_monoforum_id 派生)。
+	// Disable goes only to the parent channel; the monoforum receives no service message (the disabled footer is derived client-side from the hidden linked_monoforum_id).
 	disabledServices := paidMessagesPriceServicePeers(t, disabledAfterEnableUpdates)
 	if price := disabledServices[broadcast.ID]; price == nil || price.BroadcastMessagesAllowed || price.Stars != 0 {
 		t.Fatalf("disable parent direct messages action = %+v, want disabled stars=0", price)
@@ -1699,9 +1903,11 @@ func paidMessagesPriceServicePeers(t *testing.T, updates tg.UpdatesClass) map[in
 	return out
 }
 
-// monoforumCreationServicePeers 收集 updates 里 messageActionChannelCreate 服务消息的 peer 集合。
-// monoforum 首次开启时收到一条创建消息(TDesktop 渲染 "Direct messages were enabled in this
-// channel."),这是它在直连会话里唯一的服务消息;开关/价格变更不再往 mono 追加服务消息。
+// monoforumCreationServicePeers collects the peer set of messageActionChannelCreate
+// service messages in updates. A monoforum receives one creation message when it is
+// first enabled (TDesktop renders "Direct messages were enabled in this channel."),
+// its only service message in the direct conversation; toggles/price changes no
+// longer append service messages to the mono.
 func monoforumCreationServicePeers(t *testing.T, updates tg.UpdatesClass) map[int64]struct{} {
 	t.Helper()
 	box, ok := updates.(*tg.Updates)

@@ -912,7 +912,9 @@ func inlineExternalContentDocumentSpec(resultType string, document domain.BotInl
 		attrs = ensureDocumentAttribute(attrs, domain.DocumentAttribute{Kind: domain.DocAttrSticker})
 	}
 	attrs = ensureFilenameAttribute(attrs, inlineExternalContentFilename(resultType, mime))
-	return domain.DocumentSpec{MimeType: mime, Attributes: attrs}
+	// A "video" result stays a video even when it has no audio track; only a
+	// "gif" result is an animation.
+	return domain.DocumentSpec{MimeType: mime, Attributes: attrs, NosoundVideo: resultType == "video"}
 }
 
 func inlineExternalContentDimensions(attrs []domain.DocumentAttribute) (int, int) {
@@ -1209,7 +1211,7 @@ func tgInlineQueryPeerType(ctx context.Context, r *Router, userID, botID int64, 
 		return &tg.InlineQueryPeerTypePM{}
 	case domain.PeerTypeChannel:
 		if r.deps.Channels != nil {
-			// 只读 Megagroup 标志：走轻量 ResolveChannel，省 dialog/读态/boost 查询。
+			// Read-only Megagroup flag: use the lightweight ResolveChannel to save the dialog/read-state/boost queries.
 			if view, err := r.deps.Channels.ResolveChannel(ctx, userID, peer.ID); err == nil && !view.Channel.Megagroup {
 				return &tg.InlineQueryPeerTypeBroadcast{}
 			}

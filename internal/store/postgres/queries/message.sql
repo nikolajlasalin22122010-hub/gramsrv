@@ -125,7 +125,8 @@ INSERT INTO private_messages (
   rich_message,
   via_bot_id,
   grouped_id,
-  effect
+  effect,
+  paid_message_stars
 ) VALUES (
   $1, $2, $3, sqlc.arg(request_fingerprint)::bytea, sqlc.arg(recipient_delivered)::boolean,
   0, 0, 0, 0,
@@ -150,7 +151,8 @@ INSERT INTO private_messages (
   sqlc.arg(rich_message_json)::jsonb,
   sqlc.arg(via_bot_id)::bigint,
   sqlc.arg(grouped_id)::bigint,
-  sqlc.arg(effect)::bigint
+  sqlc.arg(effect)::bigint,
+  sqlc.arg(paid_message_stars)::bigint
 )
 ON CONFLICT (sender_user_id, random_id) WHERE random_id <> 0 DO NOTHING
 RETURNING
@@ -236,7 +238,8 @@ INSERT INTO message_boxes (
   rich_message,
   via_bot_id,
   grouped_id,
-  effect
+  effect,
+  paid_message_stars
 ) VALUES (
   $1, $2, $3, $4, $5, $6, $7, $8,
   sqlc.arg(ttl_period)::int,
@@ -270,7 +273,8 @@ INSERT INTO message_boxes (
   sqlc.arg(rich_message_json)::jsonb,
   sqlc.arg(via_bot_id)::bigint,
   sqlc.arg(grouped_id)::bigint,
-  sqlc.arg(effect)::bigint
+  sqlc.arg(effect)::bigint,
+  sqlc.arg(paid_message_stars)::bigint
 )
 RETURNING
   box_id,
@@ -316,7 +320,8 @@ RETURNING
   grouped_id,
   effect,
   reply_markup::text AS reply_markup_json,
-  rich_message::text AS rich_message_json;
+  rich_message::text AS rich_message_json,
+  paid_message_stars;
 
 -- name: GetMessageBoxByPrivateMessage :one
 SELECT
@@ -363,7 +368,8 @@ SELECT
   grouped_id,
   effect,
   reply_markup::text AS reply_markup_json,
-  rich_message::text AS rich_message_json
+  rich_message::text AS rich_message_json,
+  paid_message_stars
 FROM message_boxes
 WHERE owner_user_id = $1
   AND private_message_id = $2
@@ -508,6 +514,7 @@ base AS NOT MATERIALIZED (
     m.effect,
     m.reply_markup::text AS reply_markup_json,
     m.rich_message::text AS rich_message_json,
+    m.paid_message_stars,
     COALESCE(peer_u.id, 0)::bigint AS peer_user_id,
     COALESCE(peer_u.access_hash, 0)::bigint AS peer_access_hash,
     COALESCE(peer_u.phone, '')::text AS peer_phone,
@@ -711,6 +718,7 @@ SELECT
   effect,
   reply_markup_json,
   rich_message_json,
+  paid_message_stars,
   peer_user_id,
   peer_access_hash,
   peer_phone,
@@ -745,11 +753,13 @@ FROM paged
 ORDER BY box_id DESC;
 
 -- name: ListMessagesBackward :many
--- backward 热路径(add_offset>=0:初始加载/上滑翻页)的扁平静态查询。
--- 与 ListMessagesByUser 的 backward 分支逐位等价(相同 base 过滤 + 相同 anchor +
--- ORDER BY box_id DESC + OFFSET GREATEST(add_offset,0) + LIMIT),但只规划单次
--- index scan + 2 LEFT JOIN,避免大 CTE 把 4 个分支全树规划。total 走
--- 独立 CountMessagesByUser,仅 NeedTotalCount 时发。
+-- A flat, static query for the backward hot path (add_offset>=0: initial load /
+-- scroll-up paging). It is bit-for-bit equivalent to ListMessagesByUser's backward
+-- branch (same base filter + same anchor + ORDER BY box_id DESC +
+-- OFFSET GREATEST(add_offset,0) + LIMIT), but plans only a single index scan +
+-- 2 LEFT JOINs, avoiding a big CTE that plans all four branches as a whole tree.
+-- total goes through the separate CountMessagesByUser, issued only when
+-- NeedTotalCount.
 SELECT
   m.box_id,
   m.private_message_id,
@@ -795,6 +805,7 @@ SELECT
   m.effect,
   m.reply_markup::text AS reply_markup_json,
   m.rich_message::text AS rich_message_json,
+  m.paid_message_stars,
   COALESCE(peer_u.id, 0)::bigint AS peer_user_id,
   COALESCE(peer_u.access_hash, 0)::bigint AS peer_access_hash,
   COALESCE(peer_u.phone, '')::text AS peer_phone,
@@ -896,8 +907,9 @@ OFFSET GREATEST(sqlc.arg(row_offset)::int, 0)
 LIMIT sqlc.arg(limit_count)::int;
 
 -- name: CountMessagesByUser :one
--- ListMessagesByUser total CTE 的独立化:相同 base 过滤(不含分页 anchor),
--- 仅 NeedTotalCount 时发,避免热路径(getHistory 恒不需 total)次次规划 count 子树。
+-- Separation of ListMessagesByUser's total CTE: same base filter (without the
+-- paging anchor), issued only when NeedTotalCount, so the hot path (getHistory,
+-- which never needs total) does not plan the count subtree each time.
 SELECT count(*)::int AS total_count
 FROM message_boxes m
 WHERE m.owner_user_id = sqlc.arg(owner_user_id)::bigint
@@ -1007,6 +1019,7 @@ SELECT
   m.effect,
   m.reply_markup::text AS reply_markup_json,
   m.rich_message::text AS rich_message_json,
+  m.paid_message_stars,
   COALESCE(peer_u.id, 0)::bigint AS peer_user_id,
   COALESCE(peer_u.access_hash, 0)::bigint AS peer_access_hash,
   COALESCE(peer_u.phone, '')::text AS peer_phone,
@@ -1148,7 +1161,8 @@ SELECT
   grouped_id,
   effect,
   reply_markup::text AS reply_markup_json,
-  rich_message::text AS rich_message_json
+  rich_message::text AS rich_message_json,
+  paid_message_stars
 FROM message_boxes
 WHERE owner_user_id = ANY(sqlc.arg(owner_user_ids)::bigint[])
   AND message_sender_id = sqlc.arg(message_sender_id)::bigint
@@ -1237,7 +1251,8 @@ RETURNING
   grouped_id,
   effect,
   reply_markup::text AS reply_markup_json,
-  rich_message::text AS rich_message_json;
+  rich_message::text AS rich_message_json,
+  paid_message_stars;
 
 -- name: GetDialogReadStateForUpdate :one
 SELECT
@@ -1539,7 +1554,8 @@ SELECT
   grouped_id,
   effect,
   reply_markup::text AS reply_markup_json,
-  rich_message::text AS rich_message_json
+  rich_message::text AS rich_message_json,
+  paid_message_stars
 FROM message_boxes
 WHERE owner_user_id = @owner_user_id
   AND peer_type = @peer_type
@@ -1574,8 +1590,8 @@ WHERE owner_user_id = sqlc.arg(owner_user_id)::bigint
   AND pinned <> sqlc.arg(pinned)::boolean;
 
 -- name: UnpinAllMessageBoxesByPeer :many
--- 按批清除（affectedHistory.offset 续清语义），单条 updatePinnedMessages
--- 的 messages 向量随之有界。
+-- Clear in batches (the affectedHistory.offset continue-clearing semantics), so the
+-- messages vector of a single updatePinnedMessages stays bounded.
 WITH target AS (
   SELECT m.owner_user_id, m.box_id
   FROM message_boxes m

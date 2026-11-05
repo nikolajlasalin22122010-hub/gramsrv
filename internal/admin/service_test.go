@@ -1736,6 +1736,23 @@ func TestPublishStarGiftCollectiblesAllowsDeterministicModelAndPattern(t *testin
 	}
 }
 
+// Official snapshots send permille=0 attributes for sold-out limited gifts, which the import must accept; a negative weight is still invalid.
+func TestOfficialRarityAcceptsZeroPermille(t *testing.T) {
+	zero := 0
+	kind, permille, err := officialRarity(officialgifts.Rarity{Kind: "permille", Permille: &zero})
+	if err != nil || kind != domain.StarGiftRarityPermille || permille != 0 {
+		t.Fatalf("zero permille = (%q, %d, %v)", kind, permille, err)
+	}
+	negative := -1
+	if _, _, err := officialRarity(officialgifts.Rarity{Kind: "permille", Permille: &negative}); err == nil {
+		t.Fatal("negative permille was accepted")
+	}
+	missing := officialgifts.Rarity{Kind: "permille"}
+	if _, _, err := officialRarity(missing); err == nil {
+		t.Fatal("missing permille was accepted")
+	}
+}
+
 func TestImportOfficialStarGiftPreservesCraftedRarityAndPublishesBundle(t *testing.T) {
 	permille := 922
 	source := &fakeOfficialGiftsSource{bundle: officialgifts.Bundle{
@@ -1782,7 +1799,7 @@ func TestImportOfficialStarGiftPreservesCraftedRarityAndPublishesBundle(t *testi
 		t.Fatalf("imported models=%+v backdrops=%+v", models, gifts.lastBundle.Collectible.Backdrops)
 	}
 	catalog := gifts.lastBundle.Catalog
-	// The collectible supply ("уникальный тираж") configures the pool alone and
+	// The collectible supply ("unique supply") configures the pool alone and
 	// never turns the base gift into a limited edition: without the explicit
 	// Limited flag the base catalog stays unlimited even when the snapshot and
 	// pool carry finite numbers. Sold-out, resale, and sale-date state still does

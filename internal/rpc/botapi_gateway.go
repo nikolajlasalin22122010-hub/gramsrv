@@ -289,7 +289,7 @@ func (r *Router) BotAPISendMessage(ctx context.Context, botID, chatID int64, tex
 	if utf8.RuneCountInString(text) > domain.MaxMessageTextLength {
 		return domain.Message{}, errors.New("MESSAGE_TOO_LONG")
 	}
-	// 服务端自动实体补全必须早于私聊/频道分流，两条写路径落同一份结果。
+	// Server-side automatic entity augmentation must come before the private-chat/channel split, so both write paths land on the same result.
 	entities = r.augmentBotAPIAutoEntities(text, entities)
 	var reply *domain.MessageReply
 	if replyToMessageID > 0 {
@@ -404,7 +404,7 @@ func (r *Router) BotAPISendMedia(ctx context.Context, botID, chatID int64, kind,
 	if utf8.RuneCountInString(caption) > domain.MaxMessageTextLength {
 		return domain.Message{}, errors.New("MESSAGE_TOO_LONG")
 	}
-	// caption 与正文同口径：/buy 等命令、@mention、裸域名都要有服务端实体才蓝显。
+	// The caption is treated the same way as the body text: commands like /buy, @mentions and bare domains all need a server-side entity to render in blue.
 	entities = r.augmentBotAPIAutoEntities(caption, entities)
 	media, err := r.botAPIMedia(ctx, botID, kind, locationKey, remoteURL, fileName, mimeType, fileBytes)
 	if err != nil {
@@ -614,7 +614,12 @@ func (r *Router) botAPIDocumentMedia(ctx context.Context, botID int64, kind stri
 	var err error
 	switch {
 	case len(file.Bytes) > 0:
-		document, err = r.deps.Files.CreateDocumentFromBytes(ctx, file.Bytes, domain.DocumentSpec{MimeType: file.MimeType, Attributes: attrs, ForceFile: forceFile})
+		// The official Bot API sends videos through TDLib, which always sets
+		// nosound_video, so a silent sendVideo stays a video; sendAnimation
+		// already carries the animated attribute.
+		document, err = r.deps.Files.CreateDocumentFromBytes(ctx, file.Bytes, domain.DocumentSpec{
+			MimeType: file.MimeType, Attributes: attrs, ForceFile: forceFile, NosoundVideo: kind == "video",
+		})
 	case file.RemoteURL != "":
 		document, err = r.deps.Files.CreateDocumentFromURL(ctx, file.RemoteURL)
 		document.Attributes = mergeDocumentAttributes(document.Attributes, attrs)
@@ -1056,7 +1061,7 @@ func (r *Router) BotAPIEditInlineMessageText(ctx context.Context, botID int64, i
 		NoWebpage: disableWebPagePreview,
 	}
 	req.SetMessage(text)
-	// inline 消息同样由服务端补自动实体，否则 /buy 在 inline 结果里不蓝显。
+	// Inline messages likewise get automatic entities augmented server-side, otherwise /buy would not render in blue in inline results.
 	if entities = r.augmentBotAPIAutoEntities(text, entities); len(entities) > 0 {
 		req.SetEntities(tgMessageEntities(entities))
 	}

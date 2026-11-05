@@ -15,6 +15,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -23,6 +24,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -39,8 +41,10 @@ import (
 	"github.com/iamxvbaba/td/telegram/dcs"
 	"github.com/iamxvbaba/td/telegram/downloader"
 	"github.com/iamxvbaba/td/tg"
+	"github.com/iamxvbaba/td/tgerr"
 	"golang.org/x/net/proxy"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/term"
 	"rsc.io/qr"
 
 	"telesrv/internal/app/stargifts"
@@ -56,9 +60,9 @@ const (
 	maxDocuments       = 50000
 	maxWorkers         = 128
 	floodWaitMargin    = 5 * time.Second
-	// defaultFetchTimeout 覆盖整个抓取过程：全量文档下载可能很久。
+	// defaultFetchTimeout covers the entire fetch: a full document download can take a long time.
 	defaultFetchTimeout = 4 * time.Hour
-	// defaultLoginTimeout 只需覆盖一次扫码：二维码约 30 秒过期，Auth 会自动换发。
+	// defaultLoginTimeout only needs to cover a single QR scan: the QR code expires in ~30 seconds and Auth reissues it automatically.
 	defaultLoginTimeout = 15 * time.Minute
 )
 
@@ -224,7 +228,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	// SOCKS5 出口被 QR 登录与目录抓取共用，只解析一次。
+	// The SOCKS5 egress is shared by QR login and catalog fetching, so it is resolved only once.
 	opts, err := clientOptions(session)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "ERROR:", err)
@@ -232,7 +236,7 @@ func main() {
 	}
 
 	if *loginQR {
-		// 登录只需要 update 通道接收 loginToken：不抓目录，也不需要 -out。
+		// Login only needs the update channel to receive the loginToken: it does not fetch the catalog and does not need -out.
 		dispatcher := tg.NewUpdateDispatcher()
 		opts.UpdateHandler = dispatcher
 		run(defaultLoginTimeout, opts, func(ctx context.Context, client *telegram.Client) error {
@@ -273,7 +277,7 @@ func main() {
 	})
 }
 
-// run 连接官方 Telegram，并在连接就绪后执行 fn。任一环节失败都以退出码 1 结束。
+// run connects to official Telegram and executes fn once the connection is ready. Any failure aborts with exit code 1.
 func run(timeout time.Duration, opts telegram.Options, fn func(context.Context, *telegram.Client) error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -288,8 +292,9 @@ func run(timeout time.Duration, opts telegram.Options, fn func(context.Context, 
 	}
 }
 
-// loginQRToken 用 QR 登录换取授权用户会话并落盘到 SESSION。
-// 不需要手机号和短信码：把 show 打印的二维码在已登录的 Telegram 里扫出来即可。
+// loginQRToken trades a QR login for an authorized user session and persists it to SESSION.
+// No phone number or SMS code is needed: just scan the QR code printed by show from a logged-in Telegram.
+// An account with two-step verification also needs its cloud password; see resolvePassword.
 func loginQRToken(ctx context.Context, client *telegram.Client, dispatcher tg.UpdateDispatcher, pngPath string) error {
 	status, err := client.Auth().Status(ctx)
 	if err != nil {
@@ -300,13 +305,25 @@ func loginQRToken(ctx context.Context, client *telegram.Client, dispatcher tg.Up
 		return nil
 	}
 
-	// OnLoginToken 依赖 dispatcher 的 handlers map；map 是引用类型，与 opts.UpdateHandler
-	// 持有的是同一份，因此这里传值副本即可收到 loginToken 更新。
+	// OnLoginToken relies on the dispatcher's handlers map; a map is a reference type, and opts.UpdateHandler
+	// holds the same one, so passing a value copy here still receives loginToken updates.
 	authorization, err := client.QR().Auth(ctx, qrlogin.OnLoginToken(dispatcher), func(_ context.Context, token qrlogin.Token) error {
 		fmt.Println("[qr] scan in Telegram -> Settings -> Devices -> Link Desktop Device")
 		return showLoginQR(token.URL(), pngPath)
 	})
-	if err != nil {
+	if tgerr.Is(err, "SESSION_PASSWORD_NEEDED") {
+		// The scan was accepted, but the account has two-step verification:
+		// auth.checkPassword finishes the login on the same connection.
+		fmt.Println("[2fa] two-step verification password is required")
+		pass, passErr := resolvePassword()
+		if passErr != nil {
+			return fmt.Errorf("resolve 2fa password: %w", passErr)
+		}
+		authorization, err = client.Auth().Password(ctx, pass)
+		if err != nil {
+			return fmt.Errorf("2fa password check: %w", err)
+		}
+	} else if err != nil {
 		return fmt.Errorf("qr login: %w", err)
 	}
 	user, ok := authorization.User.AsNotEmpty()
@@ -317,7 +334,40 @@ func loginQRToken(ctx context.Context, client *telegram.Client, dispatcher tg.Up
 	return nil
 }
 
-// qrPNGPath 决定二维码 PNG 的落盘位置：默认与 SESSION 同名加后缀。
+// resolvePassword returns the 2FA cloud password: TG_PASSWORD when set, otherwise a
+// prompt that does not echo on a terminal, or the first line of piped stdin. The password
+// is never taken from a flag, because arguments are visible to other users through ps.
+// It is used exactly as given (a cloud password may start or end with spaces); only the
+// line terminator of a piped line is removed.
+func resolvePassword() (string, error) {
+	if pass := os.Getenv("TG_PASSWORD"); pass != "" {
+		return pass, nil
+	}
+	fd := int(os.Stdin.Fd())
+	if term.IsTerminal(fd) {
+		fmt.Fprint(os.Stderr, "Enter 2FA cloud password: ")
+		pass, err := term.ReadPassword(fd)
+		fmt.Fprintln(os.Stderr)
+		if err != nil {
+			return "", fmt.Errorf("read password: %w", err)
+		}
+		if len(pass) == 0 {
+			return "", errors.New("empty 2FA password")
+		}
+		return string(pass), nil
+	}
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", fmt.Errorf("read password from stdin: %w", err)
+	}
+	pass := strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+	if pass == "" {
+		return "", errors.New("2FA password required: set TG_PASSWORD, or run in a terminal or pipe it on stdin")
+	}
+	return pass, nil
+}
+
+// qrPNGPath decides where the QR PNG is written: by default the SESSION name plus a suffix.
 func qrPNGPath(session, override string) string {
 	if override = strings.TrimSpace(override); override != "" {
 		return override
@@ -325,12 +375,12 @@ func qrPNGPath(session, override string) string {
 	return session + ".qr.png"
 }
 
-// showLoginQR 把登录链接渲染成可扫的二维码。
+// showLoginQR renders the login link as a scannable QR code.
 //
-// 官方客户端只把 tg://login?token= 当作二维码内容，没有任何客户端支持把它当链接打开，
-// 所以必须画出来：终端用半块字符直接打印，同时落一份 PNG 供放大后扫描。
+// Official clients treat tg://login?token= only as QR content; no client supports opening it as a link,
+// so it must be drawn: print it directly in the terminal with half-block characters and also write a PNG for zoomed-in scanning.
 func showLoginQR(url, pngPath string) error {
-	// H 级纠错（65% 冗余）模块更多但容错高，终端缩放和手机拍照都更稳。
+	// H-level error correction (65% redundancy) has more modules but tolerates more damage, which is steadier for terminal scaling and phone photos.
 	code, err := qr.Encode(url, qr.H)
 	if err != nil {
 		return fmt.Errorf("encode login qr: %w", err)
@@ -346,10 +396,10 @@ func showLoginQR(url, pngPath string) error {
 	return nil
 }
 
-// renderTerminalQR 用半块字符把二维码画进终端，每个字符承载两行模块。
+// renderTerminalQR draws the QR code into the terminal with half-block characters, each character carrying two rows of modules.
 func renderTerminalQR(code *qr.Code) string {
 	const (
-		quiet = 2 // 静区：至少两个模块的白边，否则手机扫码识别率骤降
+		quiet = 2 // quiet zone: at least two modules of white border, otherwise phone scan recognition drops sharply
 		upper = "▀"
 		lower = "▄"
 		full  = "█"
@@ -378,7 +428,7 @@ func renderTerminalQR(code *qr.Code) string {
 	return out.String()
 }
 
-// clientOptions 组装官方客户端的公共选项：会话文件存储，以及可选的 SOCKS5 出口。
+// clientOptions assembles the common official-client options: session file storage and an optional SOCKS5 egress.
 func clientOptions(session string) (telegram.Options, error) {
 	opts := telegram.Options{
 		SessionStorage: &telegram.FileSessionStorage{Path: session},
@@ -732,6 +782,31 @@ func collectRarity(class tg.StarGiftAttributeRarityClass) (rarityManifest, error
 	}
 }
 
+// starGift.title is optional; Telegram does not send a title for "regular gifts" (clients just draw the sticker),
+// and early limited gifts that sold out may omit it too. When the title is missing, the admin import shows "Unnamed official gift",
+// so here we fill in the pattern names used on the Telegram store for the fixed regular gifts; the IDs are stable and do not change between fetches.
+var regularGiftTitles = map[int64]string{
+	5170145012310081615: "Heart",
+	5170250947678437525: "Gift Box",
+	5168103777563050263: "Rose",
+	5170144170496491616: "Cake",
+	5170314324215857265: "Bouquet",
+	5170564780938756245: "Rocket",
+	6028601630662853006: "Champagne",
+	5168043875654172773: "Trophy",
+	5170690322832818290: "Ring",
+	5170521118301225164: "Diamond",
+	5992502615223568003: "Bear",
+}
+
+// giftTitle prefers the title sent by Telegram and falls back to the pattern name only for regular gifts without a title.
+func giftTitle(gift *tg.StarGift) string {
+	if title := strings.TrimSpace(gift.Title); title != "" {
+		return title
+	}
+	return regularGiftTitles[gift.ID]
+}
+
 func collectGift(index int, class tg.StarGiftClass, addDocument addDocumentFunc) (giftManifest, error) {
 	switch gift := class.(type) {
 	case *tg.StarGift:
@@ -767,7 +842,7 @@ func collectGift(index int, class tg.StarGiftClass, addDocument addDocumentFunc)
 			GiftsPerRound:       gift.GiftsPerRound,
 			AuctionStartDate:    gift.AuctionStartDate,
 			UpgradeVariants:     gift.UpgradeVariants,
-			Title:               gift.Title,
+			Title:               giftTitle(gift),
 			DocumentIDs:         []int64{doc.ID},
 		}
 		if background, ok := gift.GetBackground(); ok {

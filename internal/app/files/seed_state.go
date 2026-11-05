@@ -112,7 +112,10 @@ func seedDocumentJSONLocationKeys(dj seedDocumentJSON, index seedDirIndex) []str
 	return keys
 }
 
-func (s *Service) seedDocumentJSONsReady(ctx context.Context, docs []seedDocumentJSON, index seedDirIndex) (bool, error) {
+// seedDocumentJSONsReady verifies that documents are fully persisted and returns the documents
+// read this time for the caller to reuse (the effects catalog recomputes its hash from this on
+// every startup — don't read the same batch of documents twice).
+func (s *Service) seedDocumentJSONsReady(ctx context.Context, docs []seedDocumentJSON, index seedDirIndex) ([]domain.Document, bool, error) {
 	expected := make(map[int64]seedDocumentJSON, len(docs))
 	ids := make([]int64, 0, len(docs))
 	locationKeys := make([]string, 0, len(docs))
@@ -134,14 +137,14 @@ func (s *Service) seedDocumentJSONsReady(ctx context.Context, docs []seedDocumen
 		}
 	}
 	if len(ids) == 0 {
-		return true, nil
+		return nil, true, nil
 	}
 	stored, err := s.media.GetDocuments(ctx, ids)
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 	if len(stored) < len(expected) {
-		return false, nil
+		return stored, false, nil
 	}
 	for _, doc := range stored {
 		dj, ok := expected[doc.ID]
@@ -149,30 +152,30 @@ func (s *Service) seedDocumentJSONsReady(ctx context.Context, docs []seedDocumen
 			continue
 		}
 		if doc.DCID != s.dc || doc.MimeType != dj.MimeType || doc.Size != dj.Size {
-			return false, nil
+			return stored, false, nil
 		}
 		if _, bundled := seedBundledDocumentPreview(dj.ID); bundled {
 			thumb, ok := seedDocumentThumbByType(doc.Thumbs, seedBundledDocumentThumbType)
 			if !ok || seedPhotoSizePreviewTier(thumb) < 4 {
-				return false, nil
+				return stored, false, nil
 			}
 		}
 		delete(expected, doc.ID)
 	}
 	if len(expected) > 0 {
-		return false, nil
+		return stored, false, nil
 	}
 	if len(locationKeys) == 0 {
-		return true, nil
+		return stored, true, nil
 	}
 	blobs, err := s.media.GetFileBlobs(ctx, locationKeys)
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 	for _, key := range locationKeys {
 		if _, ok := blobs[key]; !ok {
-			return false, nil
+			return stored, false, nil
 		}
 	}
-	return true, nil
+	return stored, true, nil
 }

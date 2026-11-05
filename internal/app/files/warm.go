@@ -3,76 +3,84 @@ package files
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
+
+	"golang.org/x/sync/errgroup"
 
 	"telesrv/internal/domain"
 )
 
-// WarmStats 汇报一次启动资源缓存预热结果。
+// warmBlobReadConcurrency limits how many blobs are read concurrently during startup warm-up.
+// The warmed blobs are all small files ≤256KB, so 8 in flight is enough to cover local disk/object
+// storage latency without saturating I/O at startup.
+const warmBlobReadConcurrency = 8
+
+// WarmStats reports the result of one startup resource-cache warm-up.
 type WarmStats struct {
 	StickerSets int
 	Documents   int
 	Blobs       int
 }
 
-// WarmCaches 从已持久化的 sticker/reaction 元数据预热小 blob 字节缓存与完整 sticker set 缓存。
-// SeedMedia 在已有数据时会跳过导入；该方法保证普通 server 重启后历史 sticker 首次渲染也不是冷缓存。
+// WarmCaches warms the small-blob byte cache and the full sticker set cache from persisted
+// sticker/reaction metadata. SeedMedia skips importing when data already exists; this method
+// ensures that after an ordinary server restart the first render of a historical sticker is not a
+// cold cache.
 func (s *Service) WarmCaches(ctx context.Context) (WarmStats, error) {
 	var stats WarmStats
-	// 第一阶段：收集所有待预热文档（贴纸集 + reaction），按 doc ID 去重。
-	seenDocs := make(map[int64]struct{})
-	docs := make([]domain.Document, 0, 256)
-	collect := func(doc domain.Document) {
-		if doc.ID == 0 {
-			return
-		}
-		if _, ok := seenDocs[doc.ID]; ok {
-			return
-		}
-		seenDocs[doc.ID] = struct{}{}
-		docs = append(docs, doc)
-	}
+	// The epoch must be taken before querying the sets: an RPC modification/deletion during the query invalidates the whole warm-up snapshot.
+	epoch := s.stickerSetCache.loadEpoch()
+	// Phase one: fetch all sticker sets + reactions at once, then fetch all documents in one query.
+	// Previously a per-set GetDocuments cost 60+ round-trips against a remote PG.
+	var sets []domain.StickerSet
+	docIDs := make([]int64, 0, 4096)
 	for _, kind := range []domain.StickerSetKind{
 		domain.StickerSetKindStickers,
 		domain.StickerSetKindEmoji,
 		domain.StickerSetKindMasks,
 		domain.StickerSetKindSystem,
 	} {
-		sets, err := s.media.ListStickerSets(ctx, kind)
+		list, err := s.media.ListStickerSets(ctx, kind)
 		if err != nil {
 			return stats, err
 		}
-		for _, set := range sets {
-			setDocs, err := s.media.GetDocuments(ctx, set.DocumentIDs)
-			if err != nil {
-				return stats, err
-			}
-			ordered := orderDocuments(setDocs, set.DocumentIDs)
-			s.stickerSetCache.put(set, ordered)
-			stats.StickerSets++
-			for _, doc := range ordered {
-				collect(doc)
-			}
+		for _, set := range list {
+			sets = append(sets, set)
+			docIDs = append(docIDs, set.DocumentIDs...)
 		}
 	}
 	reactions, err := s.media.ListAvailableReactions(ctx)
 	if err != nil {
 		return stats, err
 	}
-	reactionIDs := make([]int64, 0, len(reactions)*4)
 	for _, reaction := range reactions {
-		reactionIDs = append(reactionIDs, reaction.DocumentIDs()...)
+		docIDs = append(docIDs, reaction.DocumentIDs()...)
 	}
-	reactionDocs, err := s.media.GetDocuments(ctx, reactionIDs)
+	allDocs, err := s.media.GetDocuments(ctx, docIDs)
 	if err != nil {
 		return stats, err
 	}
-	for _, doc := range reactionDocs {
-		collect(doc)
+	byID := make(map[int64]domain.Document, len(allDocs))
+	for _, doc := range allDocs {
+		byID[doc.ID] = doc
 	}
+	for _, set := range sets {
+		ordered := make([]domain.Document, 0, len(set.DocumentIDs))
+		for _, id := range set.DocumentIDs {
+			if doc, ok := byID[id]; ok {
+				ordered = append(ordered, doc)
+			}
+		}
+		if s.stickerSetCache.putIfEpoch(set, ordered, epoch) {
+			stats.StickerSets++
+		}
+	}
+	// GetDocuments has already deduplicated by id, and docIDs is exactly the union of the sticker sets' and reactions' documents.
+	docs := allDocs
 	stats.Documents = len(docs)
 
-	// 第二阶段：一发 ANY 查询批量取所有 location key 的 blob 元数据，替代过去逐个
-	// GetFileBlob 的启动期 N+1（~2400 个 blob 各打一次 PG → 一次往返）。
+	// Phase two: one ANY query batch-fetches blob metadata for all location keys, replacing the old
+	// startup-time N+1 of per-blob GetFileBlob (~2400 blobs each hitting PG → one round-trip).
 	keys := make([]string, 0, len(docs)*2)
 	for _, doc := range docs {
 		keys = append(keys, blobLocationKeys(doc)...)
@@ -81,25 +89,38 @@ func (s *Service) WarmCaches(ctx context.Context) (WarmStats, error) {
 	if err != nil {
 		return stats, err
 	}
-	// 第三阶段：填充元数据缓存，并把小 blob 的全量字节读入字节缓存（blob backend 读，非 PG）。
+	// Phase three: fill the metadata cache and read the small blobs' full bytes into the byte cache
+	// (a blob backend read, not PG). Reads are parallelized against the blob backend: sequentially a
+	// restart would read thousands of small files in order, spending the vast majority of 2.3s
+	// waiting on individual read latency. Hashes/counters use atomics; the caches themselves are locked.
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.SetLimit(warmBlobReadConcurrency)
+	var warmed atomic.Int64
 	for _, key := range keys {
 		blob, ok := blobs[key]
 		if !ok {
 			continue
 		}
 		s.blobCache.put(key, blob)
-		warmed, err := s.warmBlobBytes(ctx, blob)
-		if err != nil {
-			return stats, err
-		}
-		if warmed {
-			stats.Blobs++
-		}
+		group.Go(func() error {
+			ok, err := s.warmBlobBytes(groupCtx, blob)
+			if err != nil {
+				return err
+			}
+			if ok {
+				warmed.Add(1)
+			}
+			return nil
+		})
 	}
+	if err := group.Wait(); err != nil {
+		return stats, err
+	}
+	stats.Blobs = int(warmed.Load())
 	return stats, nil
 }
 
-// blobLocationKeys 返回一个文档需预热的全部 location key（主体 + 可下载缩略图）。
+// blobLocationKeys returns all location keys a document needs warmed (main body + downloadable thumbnails).
 func blobLocationKeys(doc domain.Document) []string {
 	if doc.ID == 0 {
 		return nil
@@ -115,8 +136,8 @@ func blobLocationKeys(doc domain.Document) []string {
 	return keys
 }
 
-// warmBlobBytes 把小 blob 的全量字节读入 byteCache（大 blob 跳过，仍由 GetRange 分段读）。
-// 返回是否实际写入了字节缓存。
+// warmBlobBytes reads a small blob's full bytes into byteCache (large blobs are skipped and still
+// read in ranges by GetRange). Returns whether bytes were actually written to the byte cache.
 func (s *Service) warmBlobBytes(ctx context.Context, blob domain.FileBlob) (bool, error) {
 	if blob.Size <= 0 || blob.Size > blobBytesCacheMaxEntryBytes || s.byteCache.has(blob.ObjectKey) {
 		return false, nil

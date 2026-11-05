@@ -21,8 +21,11 @@ import (
 	"telesrv/internal/store/memory"
 )
 
-// fakeFiles 是 FilesService 的最小测试替身：贴纸文档可解析，上传图片返回固定 Photo。
+// fakeFiles is the minimal test double for FilesService: sticker documents resolve, and an uploaded image returns a fixed Photo.
 type fakeFiles struct {
+	// lastDocumentSpec is the spec of the latest CreateDocumentFromUpload or
+	// CreateDocumentFromBytes call.
+	lastDocumentSpec   domain.DocumentSpec
 	docs               map[int64]domain.Document
 	photos             map[int64]domain.Photo
 	profile            map[fakeProfilePhotoKey]int64
@@ -44,6 +47,7 @@ type fakeFiles struct {
 	getFileChunk       domain.FileChunk
 	getFileFound       bool
 	getFileCalls       int
+	ensureAvatarErr    error
 }
 
 type fakeProfilePhotoKey struct {
@@ -576,9 +580,11 @@ func fakeAvatarStaticSizes() []domain.PhotoSize {
 }
 func (f *fakeFiles) CreateDocumentFromUpload(_ context.Context, _ domain.UploadedFileRef, spec domain.DocumentSpec) (domain.Document, error) {
 	f.createUploadCalls++
+	f.lastDocumentSpec = spec
 	return domain.Document{ID: 888, AccessHash: 8, DCID: 2, MimeType: spec.MimeType, Attributes: spec.Attributes}, nil
 }
 func (f *fakeFiles) CreateDocumentFromBytes(_ context.Context, data []byte, spec domain.DocumentSpec) (domain.Document, error) {
+	f.lastDocumentSpec = spec
 	doc := domain.Document{
 		ID:         8400 + int64(len(f.docs)),
 		AccessHash: 84,
@@ -631,6 +637,24 @@ func (f *fakeFiles) CreateDocumentFromURL(_ context.Context, rawURL string) (dom
 func (f *fakeFiles) GetPhoto(_ context.Context, id int64) (domain.Photo, bool, error) {
 	p, ok := f.photos[id]
 	return p, ok, nil
+}
+func (f *fakeFiles) EnsureAvatarPhoto(_ context.Context, photo domain.Photo) (domain.Photo, error) {
+	if f.ensureAvatarErr != nil {
+		return domain.Photo{}, f.ensureAvatarErr
+	}
+	hasA, hasC := false, false
+	for _, s := range photo.Sizes {
+		switch s.Type {
+		case "a":
+			hasA = true
+		case "c":
+			hasC = true
+		}
+	}
+	if hasA && hasC {
+		return photo, nil
+	}
+	return f.putPhoto(domain.Photo{ID: 782, AccessHash: 7, DCID: 2, Sizes: fakeAvatarStaticSizes()}), nil
 }
 func (f *fakeFiles) GetDocument(_ context.Context, id int64) (domain.Document, bool, error) {
 	d, ok := f.docs[id]
@@ -929,7 +953,7 @@ func TestSendMultiMediaPartialFailureSubsetRetryKeepsReservedGroupedID(t *testin
 		Message:  "first",
 	}
 	second := tg.InputSingleMedia{
-		// 首次请求时 556 尚不存在，使第一条已提交后第二条解析失败。
+		// On the first request 556 does not exist yet, so the second item fails to resolve after the first has been committed.
 		Media:    &tg.InputMediaDocument{ID: &tg.InputDocument{ID: 556, AccessHash: 6}},
 		RandomID: 41002,
 		Message:  "second",
@@ -1254,15 +1278,48 @@ func TestStickerSetDoesNotExposeUnserviceableDownloadThumb(t *testing.T) {
 		ThumbDCID:    2,
 		ThumbVersion: 123,
 		Thumbs: []domain.PhotoSize{
+			{Kind: domain.PhotoSizeKindCached, Type: "m", W: 100, H: 100, Bytes: []byte{4, 5, 6}},
+			{Kind: domain.PhotoSizeKindStripped, Type: "i", Bytes: []byte{1, 8, 8}},
 			{Kind: domain.PhotoSizeKindPath, Type: "j", Bytes: []byte{1, 2, 3}},
 			{Kind: domain.PhotoSizeKindDefault, Type: "a", W: 100, H: 100, Size: 4096},
 		},
 	})
 	thumbs, ok := set.GetThumbs()
 	if !ok || len(thumbs) != 1 {
-		t.Fatalf("thumbs = %#v, want only non-downloadable path thumb", thumbs)
+		t.Fatalf("thumbs = %#v, want only the path thumb", thumbs)
 	}
 	if _, ok := thumbs[0].(*tg.PhotoPathSize); !ok {
 		t.Fatalf("thumb[0] = %T, want PhotoPathSize", thumbs[0])
+	}
+}
+
+// A set whose thumbs are only inline previews (here copied from a seed
+// document) must not advertise a set-thumb location: TDesktop builds
+// inputStickerSetThumb for a cached size, and upload.getFile cannot serve it.
+func TestStickerSetWithInlineOnlyThumbsFallsBackToThumbDocument(t *testing.T) {
+	set := tgStickerSet(domain.StickerSet{
+		ID:              99,
+		AccessHash:      7,
+		Title:           "Set",
+		ShortName:       "set",
+		ThumbDocumentID: 555,
+		ThumbDCID:       2,
+		ThumbVersion:    1,
+		Thumbs: []domain.PhotoSize{
+			{Kind: domain.PhotoSizeKindStripped, Type: "i", Bytes: []byte{1, 8, 8}},
+			{Kind: domain.PhotoSizeKindCached, Type: "m", W: 100, H: 100, Bytes: []byte{4, 5, 6}},
+		},
+	})
+	if thumbs, ok := set.GetThumbs(); ok {
+		t.Fatalf("thumbs = %#v, want none", thumbs)
+	}
+	if dc, ok := set.GetThumbDCID(); ok {
+		t.Fatalf("thumb_dc_id = %d, want unset", dc)
+	}
+	if version, ok := set.GetThumbVersion(); ok {
+		t.Fatalf("thumb_version = %d, want unset", version)
+	}
+	if id, ok := set.GetThumbDocumentID(); !ok || id != 555 {
+		t.Fatalf("thumb_document_id = %d, %v, want 555", id, ok)
 	}
 }

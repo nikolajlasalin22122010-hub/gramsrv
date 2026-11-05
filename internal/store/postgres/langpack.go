@@ -12,13 +12,13 @@ import (
 	"telesrv/internal/store/postgres/sqlcgen"
 )
 
-// LangPackStore 用 PostgreSQL 实现 store.LangPackStore。
+// LangPackStore implements store.LangPackStore with PostgreSQL.
 type LangPackStore struct {
 	db sqlcgen.DBTX
 	q  *sqlcgen.Queries
 }
 
-// NewLangPackStore 基于 pgx 连接池（或事务）创建 LangPackStore。
+// NewLangPackStore creates a LangPackStore backed by a pgx pool (or transaction).
 func NewLangPackStore(db sqlcgen.DBTX) *LangPackStore {
 	return &LangPackStore{db: db, q: sqlcgen.New(db)}
 }
@@ -129,6 +129,26 @@ func (s *LangPackStore) ReconcileSeed(ctx context.Context, seed domain.LangPackS
 		return 0, fmt.Errorf("commit langpack seed reconciliation: %w", err)
 	}
 	return written, nil
+}
+
+// PutSeedCatalog only overwrites the catalog manifest snapshot, for the startup path where "the
+// content hash is unchanged but the file stat metadata needs refreshing", avoiding a full
+// ReconcileSeed just to rewrite the size/mtime.
+func (s *LangPackStore) PutSeedCatalog(ctx context.Context, catalog domain.LangPackSeedCatalog) error {
+	if catalog.Catalog == "" {
+		catalog.Catalog = "default"
+	}
+	encoded, err := json.Marshal(catalog)
+	if err != nil {
+		return fmt.Errorf("encode langpack seed catalog %q: %w", catalog.Catalog, err)
+	}
+	if err := s.q.PutLangPackSeedHash(ctx, sqlcgen.PutLangPackSeedHashParams{
+		Key:         langPackSeedManifestStateKey(catalog.Catalog),
+		ContentHash: string(encoded),
+	}); err != nil {
+		return fmt.Errorf("put langpack seed catalog %q: %w", catalog.Catalog, err)
+	}
+	return nil
 }
 
 func (s *LangPackStore) UpsertPack(ctx context.Context, pack domain.LangPack) error {
@@ -285,7 +305,7 @@ func reconcileSeedWith(ctx context.Context, tx pgx.Tx, q *sqlcgen.Queries, seed 
 	}); err != nil {
 		return 0, fmt.Errorf("put langpack seed scopes for %q: %w", catalog, err)
 	}
-	manifest := seedCatalogSnapshot(seed)
+	manifest := seed.CatalogSnapshot()
 	encodedManifest, err := json.Marshal(manifest)
 	if err != nil {
 		return 0, fmt.Errorf("encode langpack seed catalog %q: %w", catalog, err)
@@ -393,25 +413,6 @@ func validateSeedEntry(entry domain.LangPackSeedEntry) error {
 		return fmt.Errorf("langpack %s/%s loaded %d strings, want %d", entry.Pack.LangPack, entry.Pack.LangCode, len(entry.Pack.Strings), entry.StringsCount)
 	}
 	return nil
-}
-
-func seedCatalogSnapshot(seed domain.LangPackSeed) domain.LangPackSeedCatalog {
-	state := domain.LangPackSeedCatalog{
-		Catalog: seed.Catalog,
-		Scopes:  append([]string(nil), seed.Scopes...),
-		Packs:   make([]domain.LangPackSeedCatalogEntry, 0, len(seed.Packs)),
-	}
-	for _, entry := range seed.Packs {
-		state.Packs = append(state.Packs, domain.LangPackSeedCatalogEntry{
-			LangPack:     entry.Pack.LangPack,
-			LangCode:     entry.Pack.LangCode,
-			Version:      entry.Pack.Version,
-			SourceHash:   entry.SourceHash,
-			ContentHash:  entry.ContentHash,
-			StringsCount: entry.StringsCount,
-		})
-	}
-	return state
 }
 
 func invalidateLangPackSeedCatalogs(ctx context.Context, db sqlcgen.DBTX) error {

@@ -3,6 +3,7 @@ package files
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"image/png"
 	"os"
@@ -19,7 +20,7 @@ import (
 	"telesrv/internal/store"
 )
 
-// fakeMediaStore 是 store.MediaStore 的内存替身，用于在无 PG 时验证 seed 导入器。
+// fakeMediaStore is an in-memory stand-in for store.MediaStore, used to verify the seed importer without PG.
 type fakeMediaStore struct {
 	mu        sync.Mutex
 	blobs     map[string]domain.FileBlob
@@ -31,7 +32,7 @@ type fakeMediaStore struct {
 	webPages  map[int64]domain.MessageWebPage
 	seedState map[string]string
 	receipts  map[string]domain.UploadedMediaReceipt
-	// profilePhotos[ownerID|kind] 保存某 owner 当前 profile/fallback 照片引用。
+	// profilePhotos[ownerID|kind] holds an owner's current profile/fallback photo reference.
 	profilePhotos map[string]domain.ProfilePhotoRef
 }
 
@@ -176,6 +177,50 @@ func (f *fakeMediaStore) GetFileBlobs(_ context.Context, keys []string) (map[str
 		}
 	}
 	return out, nil
+}
+
+func (f *fakeMediaStore) SeedThumbStates(_ context.Context, documentIDs []int64) ([]store.SeedThumbState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]store.SeedThumbState, 0, len(documentIDs))
+	for _, id := range documentIDs {
+		doc, ok := f.docs[id]
+		if !ok {
+			continue
+		}
+		for _, thumb := range doc.Thumbs {
+			state := store.SeedThumbState{
+				DocumentID:   doc.ID,
+				Type:         thumb.Type,
+				Kind:         string(thumb.Kind),
+				DeclaredSize: thumb.Size,
+				DataSize:     len(thumb.Bytes),
+				Head:         thumb.Bytes,
+			}
+			if len(state.Head) > 12 {
+				state.Head = state.Head[:12]
+			}
+			if blob, ok := f.blobs[fmt.Sprintf("doc:%d:%s", doc.ID, thumb.Type)]; ok {
+				state.HasBlob = true
+				state.BlobSize = blob.Size
+				state.BlobMime = blob.MimeType
+			}
+			out = append(out, state)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeMediaStore) CountStickerSetsByIDs(_ context.Context, ids []int64) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, id := range ids {
+		if _, ok := f.sets[id]; ok {
+			n++
+		}
+	}
+	return n, nil
 }
 
 func (f *fakeMediaStore) GetSeedState(_ context.Context, key string) (string, bool, error) {
@@ -545,8 +590,8 @@ func TestSeedMediaRepairsPartialReactionBlobs(t *testing.T) {
 	if string(chunk.Bytes) != "tgs!" {
 		t.Fatalf("prewarmed chunk = %q, want tgs!", chunk.Bytes)
 	}
-	if blobs.getRangeCalls != 0 {
-		t.Fatalf("seeded small blob should be served from byte cache, GetRange calls = %d", blobs.getRangeCalls)
+	if got := blobs.getRangeCalls.Load(); got != 0 {
+		t.Fatalf("seeded small blob should be served from byte cache, GetRange calls = %d", got)
 	}
 
 	media.mu.Lock()
@@ -739,6 +784,56 @@ func TestSeedMediaSkipsUnchangedEffectsDocuments(t *testing.T) {
 	}
 }
 
+func TestSeedEffectsInvalidatesHashWhenCachedThumbnailGrows(t *testing.T) {
+	ctx := context.Background()
+	seedDir := t.TempDir()
+	const sourceID int64 = 1000001
+	writeEffectsSeed(t, seedDir, sourceID)
+	path := filepath.Join(seedDir, "telegram_effects_export", "effects.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := bytes.Replace(raw, []byte(`"thumbs":[]`), []byte(`"thumbs":[{"_":"PhotoCachedSize","type":"m","w":128,"h":128,"bytes":"ffd8ff01"}]`), 1)
+	if err := os.WriteFile(path, before, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	media := newFakeMediaStore()
+	blobs, err := NewLocalFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := NewService(media, blobs, 2)
+	if _, err := svc.SeedMedia(ctx, seedDir, 0); err != nil {
+		t.Fatal(err)
+	}
+	_, oldHash, err := svc.AvailableEffects(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// PhotoCachedSize has no explicit size; the size delivered by RPC comes from len(Bytes).
+	after := bytes.Replace(before, []byte(`"bytes":"ffd8ff01"`), []byte(`"bytes":"ffd8ff01020304"`), 1)
+	if err := os.WriteFile(path, after, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	svc = NewService(media, blobs, 2)
+	if _, err := svc.SeedMedia(ctx, seedDir, 0); err != nil {
+		t.Fatal(err)
+	}
+	doc, found, err := media.GetDocument(ctx, sourceID)
+	if err != nil || !found || len(doc.Thumbs) != 1 || len(doc.Thumbs[0].Bytes) != 7 {
+		t.Fatalf("updated thumbnail = %+v, found=%v err=%v", doc.Thumbs, found, err)
+	}
+	_, newHash, err := svc.AvailableEffects(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newHash == oldHash {
+		t.Fatalf("thumbnail grew 4 -> 7 bytes, but effects hash stayed %d", newHash)
+	}
+}
+
 func TestSeedEffectsDoesNotDowngradeSharedStickerPreview(t *testing.T) {
 	ctx := context.Background()
 	seedDir := t.TempDir()
@@ -841,7 +936,7 @@ func TestSeedMediaFromRealExport(t *testing.T) {
 		t.Error("expected blobs imported")
 	}
 
-	// reaction 引用的文档应能被解析回真实 document（带 sticker 属性 + 主体 blob）。
+	// A document referenced by a reaction should resolve back to a real document (with a sticker attribute + main blob).
 	reactions, _ := media.ListAvailableReactions(context.Background())
 	if len(reactions) == 0 {
 		t.Fatal("no reactions stored")
@@ -864,7 +959,7 @@ func TestSeedMediaFromRealExport(t *testing.T) {
 		}
 	}
 
-	// 一个常规贴纸集应有 documents 且能按 short_name 解析。
+	// A regular sticker set should have documents and resolve by short_name.
 	for _, s := range media.sets {
 		for _, thumb := range s.Thumbs {
 			if thumb.Downloadable() {
@@ -1318,5 +1413,216 @@ func TestSeedFreezeEmojiMarkDocumentImportsFromBinary(t *testing.T) {
 	}
 	if set.Kind != domain.StickerSetKindEmoji || !set.Emojis {
 		t.Fatalf("freeze set kind = %v emojis=%v, want emoji set", set.Kind, set.Emojis)
+	}
+}
+
+func TestSeedMediaSkipsUnchangedStickerExportTree(t *testing.T) {
+	ctx := context.Background()
+	seedDir := t.TempDir()
+	dir := filepath.Join(seedDir, "telegram_stickers_export", "TestSet_1")
+	writeInputSetTypeSeed(t, dir, "InputStickerSetShortName", "TestSet", 1, 1001, false)
+	// A set appearing in two export directories is a real case (e.g. a Topics emoji set); the ids in
+	// the index must be deduplicated, otherwise the "set still exists" count never matches and the fast
+	// path is always skipped.
+	writeInputSetTypeSeed(t, filepath.Join(seedDir, "telegram_emoji_export", "TestSet_1"), "InputStickerSetShortName", "TestSet", 1, 1001, true)
+
+	media := newFakeMediaStore()
+	blobs, err := NewLocalFS(t.TempDir())
+	if err != nil {
+		t.Fatalf("local fs: %v", err)
+	}
+	svc := NewService(media, blobs, 2)
+	if _, err := svc.SeedMedia(ctx, seedDir, 0); err != nil {
+		t.Fatalf("seed media: %v", err)
+	}
+
+	// Corrupt set_info.json while keeping the same size and mtime: the second seed only succeeds if the fast path really skips parsing.
+	infoPath := filepath.Join(dir, "set_info.json")
+	info, err := os.Stat(infoPath)
+	if err != nil {
+		t.Fatalf("stat set_info: %v", err)
+	}
+	raw, err := os.ReadFile(infoPath)
+	if err != nil {
+		t.Fatalf("read set_info: %v", err)
+	}
+	if err := os.WriteFile(infoPath, bytes.Repeat([]byte("x"), len(raw)), 0o600); err != nil {
+		t.Fatalf("corrupt set_info: %v", err)
+	}
+	if err := os.Chtimes(infoPath, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatalf("restore set_info mtime: %v", err)
+	}
+	stats, err := svc.SeedMedia(ctx, seedDir, 0)
+	if err != nil {
+		t.Fatalf("second seed should use the fast path, got %v", err)
+	}
+	if stats.StickerSets != 0 || stats.Documents != 0 || stats.Blobs != 0 {
+		t.Fatalf("second seed imported %+v, want no work", stats)
+	}
+}
+
+func TestSeedMediaImportsNewStickerSetWhenTreeChanges(t *testing.T) {
+	ctx := context.Background()
+	seedDir := t.TempDir()
+	first := filepath.Join(seedDir, "telegram_stickers_export", "First_1")
+	writeInputSetTypeSeed(t, first, "InputStickerSetShortName", "First", 1, 1001, false)
+
+	media := newFakeMediaStore()
+	blobs, err := NewLocalFS(t.TempDir())
+	if err != nil {
+		t.Fatalf("local fs: %v", err)
+	}
+	svc := NewService(media, blobs, 2)
+	if _, err := svc.SeedMedia(ctx, seedDir, 0); err != nil {
+		t.Fatalf("seed media: %v", err)
+	}
+
+	second := filepath.Join(seedDir, "telegram_stickers_export", "Second_2")
+	writeInputSetTypeSeed(t, second, "InputStickerSetShortName", "Second", 2, 1002, false)
+	stats, err := svc.SeedMedia(ctx, seedDir, 0)
+	if err != nil {
+		t.Fatalf("second seed media: %v", err)
+	}
+	if stats.StickerSets != 1 {
+		t.Fatalf("imported sets = %d, want 1", stats.StickerSets)
+	}
+	if _, found, err := media.GetStickerSetByID(ctx, 2); err != nil || !found {
+		t.Fatalf("new set not imported: found=%v err=%v", found, err)
+	}
+}
+
+func TestSeedMediaReimportsDeletedStickerSet(t *testing.T) {
+	ctx := context.Background()
+	seedDir := t.TempDir()
+	dir := filepath.Join(seedDir, "telegram_stickers_export", "TestSet_1")
+	writeInputSetTypeSeed(t, dir, "InputStickerSetShortName", "TestSet", 1, 1001, false)
+
+	media := newFakeMediaStore()
+	blobs, err := NewLocalFS(t.TempDir())
+	if err != nil {
+		t.Fatalf("local fs: %v", err)
+	}
+	svc := NewService(media, blobs, 2)
+	if _, err := svc.SeedMedia(ctx, seedDir, 0); err != nil {
+		t.Fatalf("seed media: %v", err)
+	}
+
+	media.mu.Lock()
+	delete(media.sets, 1)
+	media.mu.Unlock()
+
+	stats, err := svc.SeedMedia(ctx, seedDir, 0)
+	if err != nil {
+		t.Fatalf("second seed media: %v", err)
+	}
+	if stats.StickerSets != 1 {
+		t.Fatalf("reimported sets = %d, want 1", stats.StickerSets)
+	}
+	if _, found, err := media.GetStickerSetByID(ctx, 1); err != nil || !found {
+		t.Fatalf("set not restored: found=%v err=%v", found, err)
+	}
+}
+
+func TestSeedMediaHonorsIncreasedStickerSetLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		limit       int
+		legacyIndex bool
+	}{
+		{name: "larger_limit", limit: 2},
+		{name: "unlimited", limit: 0},
+		{name: "negative_unlimited", limit: -1},
+		{name: "legacy_index", limit: 0, legacyIndex: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			seedDir := t.TempDir()
+			writeInputSetTypeSeed(t, filepath.Join(seedDir, "telegram_stickers_export", "First"), "InputStickerSetShortName", "First", 1, 1000001, false)
+			writeInputSetTypeSeed(t, filepath.Join(seedDir, "telegram_stickers_export", "Second"), "InputStickerSetShortName", "Second", 2, 1000002, false)
+			media := newFakeMediaStore()
+			blobs, err := NewLocalFS(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			svc := NewService(media, blobs, 2)
+			if _, err := svc.SeedMedia(ctx, seedDir, 1); err != nil {
+				t.Fatal(err)
+			}
+			if _, found, err := media.GetStickerSetByID(ctx, 2); err != nil || found {
+				t.Fatalf("second set with limit=1: found=%v err=%v", found, err)
+			}
+			if tc.legacyIndex {
+				// v2 did not store the limit; a missing field must not be taken as all sets having been imported.
+				idx, found, err := svc.loadStickerSeedIndex(ctx)
+				if err != nil || !found {
+					t.Fatalf("load seed index: found=%v err=%v", found, err)
+				}
+				idx.Version = 2
+				idx.MaxRegularSets = 0
+				raw, err := json.Marshal(idx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := media.PutSeedState(ctx, seedStickerIndexKey, string(raw)); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if _, err := NewService(media, blobs, 2).SeedMedia(ctx, seedDir, tc.limit); err != nil {
+				t.Fatal(err)
+			}
+			set, found, err := media.GetStickerSetByID(ctx, 2)
+			if err != nil || !found || len(set.DocumentIDs) != 1 || set.DocumentIDs[0] != 1000002 {
+				t.Fatalf("second set with limit=%d: set=%+v found=%v err=%v", tc.limit, set, found, err)
+			}
+			stats, err := NewService(media, blobs, 2).SeedMedia(ctx, seedDir, tc.limit)
+			if err != nil || stats.StickerSets != 0 || stats.Documents != 0 || stats.Blobs != 0 {
+				t.Fatalf("unchanged restart: stats=%+v err=%v", stats, err)
+			}
+		})
+	}
+}
+
+func TestSeedMediaDuplicateExportsKeepFinalVersion(t *testing.T) {
+	ctx := context.Background()
+	seedDir := t.TempDir()
+	first := filepath.Join(seedDir, "telegram_default_stickers_export", "Duplicate")
+	last := filepath.Join(seedDir, "telegram_stickers_export", "Duplicate")
+	writeInputSetTypeSeed(t, first, "InputStickerSetShortName", "Duplicate", 1, 1000001, false)
+	writeInputSetTypeSeed(t, last, "InputStickerSetShortName", "Duplicate", 1, 1000002, false)
+	path := filepath.Join(last, "set_info.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, bytes.Replace(raw, []byte(`"hash":17`), []byte(`"hash":18`), 1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	media := newFakeMediaStore()
+	blobs, err := NewLocalFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewService(media, blobs, 2).SeedMedia(ctx, seedDir, 0); err != nil {
+		t.Fatal(err)
+	}
+	set, found, err := media.GetStickerSetByID(ctx, 1)
+	if err != nil || !found || set.Hash != 18 {
+		t.Fatalf("initial import: set=%+v found=%v err=%v", set, found, err)
+	}
+
+	// Adding an unrelated set triggers a rescan; two exports with the same id must still overwrite in order, without reverting to the first.
+	writeInputSetTypeSeed(t, filepath.Join(seedDir, "telegram_stickers_export", "Unrelated"), "InputStickerSetShortName", "Unrelated", 2, 1000003, false)
+	svc := NewService(media, blobs, 2)
+	if _, err := svc.SeedMedia(ctx, seedDir, 0); err != nil {
+		t.Fatal(err)
+	}
+	set, found, err = media.GetStickerSetByID(ctx, 1)
+	if err != nil || !found || set.Hash != 18 || len(set.DocumentIDs) != 1 || set.DocumentIDs[0] != 1000002 {
+		t.Fatalf("rescan regressed duplicate set: hash=%d docs=%v found=%v err=%v", set.Hash, set.DocumentIDs, found, err)
+	}
+	set, docs, found, err := svc.ResolveStickerSet(ctx, domain.StickerSetRef{Kind: domain.StickerSetRefByID, ID: 1})
+	if err != nil || !found || set.Hash != 18 || len(docs) != 1 || docs[0].ID != 1000002 {
+		t.Fatalf("cached duplicate set: hash=%d docs=%+v found=%v err=%v", set.Hash, docs, found, err)
 	}
 }

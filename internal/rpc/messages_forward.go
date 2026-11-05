@@ -149,11 +149,13 @@ func (r *Router) onMessagesForwardMessages(ctx context.Context, req *tg.Messages
 	if err != nil {
 		return nil, err
 	}
+	var forwardCharged int64
 	if toPeer.Type == domain.PeerTypeUser {
 		if req.AllowPaidFloodskip {
 			return nil, paymentUnsupportedErr()
 		}
-		if err := r.ensurePrivateContactAllowed(ctx, userID, toPeer.ID, req.AllowPaidStars, len(absentIndexes)); err != nil {
+		forwardCharged, err = r.privatePaidStarsCharge(ctx, userID, toPeer.ID, req.AllowPaidStars, len(absentIndexes))
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -193,6 +195,9 @@ func (r *Router) onMessagesForwardMessages(ctx context.Context, req *tg.Messages
 	}
 	if req.ScheduleDate != 0 && !scheduleDateIsImmediate(req.ScheduleDate, int(r.clock.Now().Unix())) {
 		return r.scheduleForwardMessages(ctx, userID, fromPeer, toPeer, req, replyTo, sendAs, preloadedSources)
+	}
+	if err := r.ensurePaidStarsBalance(ctx, userID, forwardCharged, len(absentIndexes)); err != nil {
+		return nil, err
 	}
 	absentSources, err := r.forwardSourcesForRequest(ctx, userID, fromPeer, absentIDs, preloadedSources)
 	if err != nil {
@@ -257,16 +262,20 @@ func (r *Router) onMessagesForwardMessages(ctx context.Context, req *tg.Messages
 			if sourceUserID != 0 {
 				fanoutExtraUserIDs = append(fanoutExtraUserIDs, sourceUserID)
 			}
-			// 收件人是该频道的活跃成员集，对本次转发的每条源都相同；只取一次，
-			// 避免一次转发 ≤100 条到 N 成员大群时把 recipients 累积成 ~100×N 条目
-			// 的巨大临时切片（N=10^5 时约千万级）。
+			// The recipients are the channel's active member set, identical for
+			// every source of this forward, so fetch once: this avoids
+			// accumulating recipients into a huge temporary slice of ~100xN
+			// entries when forwarding up to 100 items to a large N-member group
+			// (tens of millions at N=10^5).
 			if len(recipients) == 0 {
 				recipients = res.Recipients
 			}
 		}
-		// echo 与 fan-out 用各自独立 cache（RPC vs worker goroutine 防竞态）。多条转发汇成
-		// 一个 fan-out job（channelMessagesUpdatesWithPeerCache 内含多条 UpdateNewChannelMessage），
-		// 由同 channel 分片 FIFO 原子投递。
+		// echo and fan-out use separate caches (RPC vs worker goroutine, to avoid
+		// races). Multiple forwards merge into one fan-out job
+		// (channelMessagesUpdatesWithPeerCache containing several
+		// UpdateNewChannelMessage), delivered atomically by the same-channel
+		// shard FIFO.
 		echoCache := newViewerPeerCache(r)
 		updates := r.channelMessagesUpdatesWithPeerCache(ctx, userID, results, req.RandomID, true, extraUserIDs, echoCache)
 		if n := len(fanoutResults); n > 0 {
@@ -289,6 +298,7 @@ func (r *Router) onMessagesForwardMessages(ctx context.Context, req *tg.Messages
 		sessionID, _ := SessionIDFrom(ctx)
 		authKeyID := rawAuthKeyIDForOrigin(ctx)
 		res := domain.ForwardPrivateMessagesResult{OwnerUserID: userID}
+		var paid *domain.PaidStarsCharge
 		for i, source := range sources {
 			if replays[i].found {
 				sent := replays[i].private
@@ -327,12 +337,16 @@ func (r *Router) onMessagesForwardMessages(ctx context.Context, req *tg.Messages
 				RecipientBlocked:       recipientBlocked,
 				IdempotencyFingerprint: idempotencyFingerprints[i],
 				IdempotencyPreflighted: replays[i].checked,
+				PaidStars:              forwardCharged,
 			})
 			if err != nil {
 				return nil, messageForwardErr(err)
 			}
 			if !sent.Duplicate {
 				r.enqueueBotAPIPrivateMessageUpdateAsync(ctx, sent)
+				if sent.PaidStars != nil {
+					paid = sent.PaidStars
+				}
 			}
 			res.SenderMessages = append(res.SenderMessages, sent.SenderMessage)
 			res.RecipientMessages = append(res.RecipientMessages, sent.RecipientMessage)
@@ -341,7 +355,13 @@ func (r *Router) onMessagesForwardMessages(ctx context.Context, req *tg.Messages
 			res.Duplicates = append(res.Duplicates, sent.Duplicate)
 			res.ReplayDeleteEvents = append(res.ReplayDeleteEvents, sent.ReplayDeleteEvent)
 		}
-		return tgForwardMessagesUpdates(res, req.RandomID, r.usersForMessageUpdates(ctx, userID, res.SenderMessages), r.chatsForMessageUpdates(ctx, userID, res.SenderMessages)), nil
+		updates := tgForwardMessagesUpdates(res, req.RandomID, r.usersForMessageUpdates(ctx, userID, res.SenderMessages), r.chatsForMessageUpdates(ctx, userID, res.SenderMessages))
+		if paid != nil {
+			// Balances after the last charged message; sendOutgoing reports single sends the same way.
+			updates.Updates = append(updates.Updates, &tg.UpdateStarsBalance{Balance: &tg.StarsAmount{Amount: paid.SenderBalance}})
+			r.pushUserUpdates(ctx, toPeer.ID, &tg.Updates{Updates: []tg.UpdateClass{&tg.UpdateStarsBalance{Balance: &tg.StarsAmount{Amount: paid.RecipientBalance}}}})
+		}
+		return updates, nil
 	}
 	return nil, peerIDInvalidErr()
 }
@@ -754,9 +774,11 @@ func (r *Router) forwardAuthorDisplayName(ctx context.Context, viewerUserID, aut
 	return name
 }
 
-// applyForwardAuthorPrivacy 在首次生成 forward header 时按原作者的
-// forwards 隐私规则降级：不允许链接回账号时只保留展示名 from_name。
-// 已有 header 的再转发沿用原 header，不重新评估。
+// applyForwardAuthorPrivacy downgrades the forward header when it is first
+// generated according to the original author's forwards privacy rule: when
+// linking back to the account is not allowed, only the display name from_name is
+// kept. Re-forwarding an existing header reuses the original header without
+// re-evaluating.
 func (r *Router) applyForwardAuthorPrivacy(ctx context.Context, forwarderUserID int64, forward *domain.MessageForward) {
 	if forward == nil || forward.From.Type != domain.PeerTypeUser || forward.From.ID == 0 || forward.FromName != "" {
 		return
@@ -785,6 +807,8 @@ func messageForwardErr(err error) error {
 		return replyMessageIDInvalidErr()
 	case errors.Is(err, domain.ErrMessageRandomIDDuplicate):
 		return randomIDDuplicateErr()
+	case errors.Is(err, domain.ErrStarsInsufficient):
+		return balanceTooLowErr()
 	default:
 		return internalErr()
 	}

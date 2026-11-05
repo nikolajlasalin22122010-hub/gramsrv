@@ -2,6 +2,7 @@ package files
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -18,12 +19,13 @@ import (
 	"telesrv/internal/domain"
 )
 
-// 本文件实现从外部导出的 reaction / sticker 资源目录导入媒体种子：
-// JSON 元数据（外部导出 document id/access_hash/file_reference/attributes/thumbs）落 documents /
-// sticker_sets / available_reactions 表，二进制 .tgs/.webp/缩略图落 blob backend。
-// dc_id 统一重写为本 server 的 DC，使客户端从本 DC 下载。导入幂等（已存在则跳过）。
+// This file implements importing media seeds from externally exported reaction / sticker resource
+// directories: JSON metadata (exported document id/access_hash/file_reference/attributes/thumbs) goes
+// into the documents / sticker_sets / available_reactions tables, and binary .tgs/.webp/thumbnails go
+// to the blob backend. dc_id is uniformly rewritten to this server's DC so clients download from it.
+// The import is idempotent (an existing item is skipped).
 
-// SeedStats 汇报一次种子导入结果。
+// SeedStats reports the result of one seed import.
 type SeedStats struct {
 	Reactions   int
 	StickerSets int
@@ -33,7 +35,7 @@ type SeedStats struct {
 	Skipped     bool
 }
 
-// SeedMedia 从导出根目录导入 reaction 与 sticker 资源。maxRegularSets<=0 表示不限。
+// SeedMedia imports reaction and sticker resources from the export root. maxRegularSets<=0 means unlimited.
 func (s *Service) SeedMedia(ctx context.Context, root string, maxRegularSets int) (SeedStats, error) {
 	var stats SeedStats
 	if root == "" {
@@ -41,11 +43,12 @@ func (s *Service) SeedMedia(ctx context.Context, root string, maxRegularSets int
 		return stats, nil
 	}
 	if _, err := os.Stat(root); err != nil {
-		// 目录不存在：跳过而非失败（开发机可能未放资源）。但显式 WARN——否则「配置的 seed 目录
-		// 不存在 → 静默不导入贴纸/reaction」会被埋没（DB 已有旧数据时尤其隐蔽，表现为客户端反复
-		// 拉取未 seed 的集）。配置 TELESRV_STICKER_SEED_DIR 指向真实导出目录即可。
+		// Directory missing: skip rather than fail (a dev machine may not have the resources). But WARN
+		// explicitly — otherwise "configured seed directory missing → stickers/reactions silently not
+		// imported" would be buried (especially hidden when the DB already has old data, showing up as
+		// clients repeatedly pulling unseeded sets). Configure TELESRV_STICKER_SEED_DIR to point at the real export directory.
 		if s.log != nil {
-			s.log.Warn("sticker/reaction seed 目录不存在，跳过媒体种子导入（配置 TELESRV_STICKER_SEED_DIR）",
+			s.log.Warn("sticker/reaction seed directory does not exist; skipping media seed import (configure TELESRV_STICKER_SEED_DIR)",
 				zap.String("dir", root), zap.Error(err))
 		}
 		stats.Skipped = true
@@ -54,27 +57,56 @@ func (s *Service) SeedMedia(ctx context.Context, root string, maxRegularSets int
 
 	phaseStarted := time.Now()
 	phaseBefore := stats
-	// sticker sets（default 系统集 + 常规集 + emoji 集）：始终扫描导出目录以**增量**拾取
-	// 新增的 set 目录——importStickerSetDir 跳过内容(hash)未变的已有集,只导入新集/变更集。
-	// 这样向已部署(非空 store)的 data/sticker-seed 丢新集后重启即可生效,无需清库重 seed。
-	// 仅当检测到旧版缩略图/可渲染预览元数据缺失时 force=true 全量重导修复。
+	// Sticker sets (default system sets + regular sets + emoji sets): always scan the export directory
+	// to **incrementally** pick up new set directories — importStickerSet skips existing sets whose
+	// content (hash) is unchanged, importing only new/changed sets. This way, dropping new sets into a
+	// deployed (non-empty store) data/sticker-seed and restarting takes effect without wiping the DB and
+	// reseeding. Only when the export directory's own documents/thumbnails are missing or the old preview
+	// metadata has not been migrated does force=true trigger a full re-import.
 	forceSticker := false
 	previewState := fmt.Sprintf("%s:dc=%d", seedStickerPreviewStateVersion, s.dc)
 	if n, err := s.media.CountStickerSets(ctx); err != nil {
 		return stats, err
 	} else if n > 0 {
-		stale, err := s.stickerSetDocumentsNeedSeedRepair(ctx)
-		if err != nil {
-			return stats, err
-		}
 		migrated, err := s.seedStateMatches(ctx, seedStickerPreviewStateKey, previewState)
 		if err != nil {
 			return stats, err
 		}
-		forceSticker = stale || !migrated
+		forceSticker = !migrated
 	}
-	if err := s.seedStickerSets(ctx, root, maxRegularSets, forceSticker, &stats); err != nil {
-		return stats, fmt.Errorf("seed sticker sets: %w", err)
+	// Steady-state fast path: when the directory fingerprint (only stat'ing set_info.json) is unchanged
+	// and the last recorded document thumbnails are still serviceable, skip the JSON parsing of the whole
+	// export tree and the per-set DB queries; dropping in a new set or re-exporting changes the fingerprint.
+	skipSticker := false
+	if !forceSticker {
+		if idx, ok, err := s.loadStickerSeedIndex(ctx); err != nil {
+			return stats, err
+		} else if ok && idx.Version == seedStickerIndexVersion && idx.DC == s.dc &&
+			idx.MaxRegularSets == max(0, maxRegularSets) && len(idx.Sets) > 0 && len(idx.Documents) > 0 {
+			fingerprint, err := stickerSeedFingerprint(root)
+			if err != nil {
+				return stats, err
+			}
+			if fingerprint == idx.Fingerprint {
+				stale, err := s.documentsNeedSeedRepair(ctx, idx.Documents)
+				if err != nil {
+					return stats, err
+				}
+				present, err := s.media.CountStickerSetsByIDs(ctx, idx.Sets)
+				if err != nil {
+					return stats, err
+				}
+				skipSticker = !stale && present == len(idx.Sets)
+			}
+		}
+	}
+	if skipSticker && s.log != nil {
+		s.log.Info("sticker seed directory unchanged; skipping export directory scan and per-set queries")
+	}
+	if !skipSticker {
+		if err := s.seedStickerSets(ctx, root, maxRegularSets, forceSticker, &stats); err != nil {
+			return stats, fmt.Errorf("seed sticker sets: %w", err)
+		}
 	}
 	if err := s.putSeedState(ctx, seedStickerPreviewStateKey, previewState); err != nil {
 		return stats, fmt.Errorf("record sticker preview seed state: %w", err)
@@ -101,7 +133,7 @@ func (s *Service) SeedMedia(ctx context.Context, root string, maxRegularSets int
 
 	phaseStarted = time.Now()
 	phaseBefore = stats
-	// 消息发送特效:全局静态目录,每次启动重建内存 s.effects(文档导入幂等)。
+	// Message effects: a globally static catalog, rebuilding the in-memory s.effects on every startup (document import is idempotent).
 	if err := s.seedEffects(ctx, root, &stats); err != nil {
 		return stats, fmt.Errorf("seed effects: %w", err)
 	}
@@ -117,7 +149,7 @@ func (s *Service) logSeedPhase(phase string, started time.Time, before, after Se
 	if s.log == nil {
 		return
 	}
-	s.log.Info("媒体种子阶段完成",
+	s.log.Info("media seed phase complete",
 		zap.String("phase", phase),
 		zap.Duration("elapsed", time.Since(started)),
 		zap.Int("reactions", after.Reactions-before.Reactions),
@@ -135,7 +167,7 @@ func (s *Service) seedReactions(ctx context.Context, root string, stats *SeedSta
 	rawPath := filepath.Join(root, "telegram_reactions_export", "global_json", "available_reactions_raw.json")
 	raw, err := os.ReadFile(rawPath)
 	if err != nil {
-		return nil // 没有 reaction 资源就跳过
+		return nil // no reaction resources, skip
 	}
 	var parsed struct {
 		Result struct {
@@ -203,15 +235,31 @@ func (s *Service) availableReactionSeedNeedsRepair(ctx context.Context) (bool, e
 		return false, err
 	}
 	var docIDs []int64
+	locationKeys := make([]string, 0, len(reactions)*4)
+	seenKeys := make(map[string]struct{}, len(reactions)*4)
 	for _, r := range reactions {
 		for _, id := range r.DocumentIDs() {
 			if id == 0 {
 				continue
 			}
 			docIDs = append(docIDs, id)
-			if _, ok, err := s.media.GetFileBlob(ctx, fmt.Sprintf("doc:%d", id)); err != nil {
-				return false, err
-			} else if !ok {
+			key := fmt.Sprintf("doc:%d", id)
+			if _, ok := seenKeys[key]; ok {
+				continue
+			}
+			seenKeys[key] = struct{}{}
+			locationKeys = append(locationKeys, key)
+		}
+	}
+	// One ANY query replaces the old per-item GetFileBlob: there are hundreds of reaction icons/animations,
+	// and querying them one by one costs 6-7 seconds on a remote PG.
+	if len(locationKeys) > 0 {
+		blobs, err := s.media.GetFileBlobs(ctx, locationKeys)
+		if err != nil {
+			return false, err
+		}
+		for _, key := range locationKeys {
+			if _, ok := blobs[key]; !ok {
 				return true, nil
 			}
 		}
@@ -224,102 +272,276 @@ func (s *Service) availableReactionSeedNeedsRepair(ctx context.Context) (bool, e
 
 // ---- sticker sets ----
 
-func (s *Service) seedStickerSets(ctx context.Context, root string, maxRegular int, force bool, stats *SeedStats) error {
-	// default 系统集：目录名 → system_key。
-	defaultDir := filepath.Join(root, "telegram_default_stickers_export")
-	order := 0
-	if entries, err := os.ReadDir(defaultDir); err == nil {
-		names := make([]string, 0, len(entries))
-		for _, e := range entries {
-			if e.IsDir() {
-				names = append(names, e.Name())
-			}
-		}
-		sort.Strings(names)
-		for _, name := range names {
-			systemKey := systemKeyForDefaultSet(name)
-			setDir := filepath.Join(defaultDir, name)
-			if err := s.importStickerSetDir(ctx, setDir, systemKey, order, force, stats); err != nil {
-				return fmt.Errorf("import default set %s: %w", name, err)
-			}
-			order++
-		}
-	}
-
-	// custom-emoji 集（telegram_emoji_export/<set>/）：不受 maxRegular 限制,按 set_info 的
-	// emojis 标志归入 StickerSetKindEmoji(getEmojiStickers/getFeaturedEmojiStickers 下发)。
-	emojiDir := filepath.Join(root, "telegram_emoji_export")
-	if entries, err := os.ReadDir(emojiDir); err == nil {
-		names := make([]string, 0, len(entries))
-		for _, e := range entries {
-			if e.IsDir() {
-				names = append(names, e.Name())
-			}
-		}
-		sort.Strings(names)
-		for _, name := range names {
-			setDir := filepath.Join(emojiDir, name)
-			if err := s.importStickerSetDir(ctx, setDir, "", order, force, stats); err != nil {
-				return fmt.Errorf("import emoji set %s: %w", name, err)
-			}
-			order++
-		}
-	}
-
-	// 常规贴纸集。
-	regularDir := filepath.Join(root, "telegram_stickers_export")
-	if entries, err := os.ReadDir(regularDir); err == nil {
-		names := make([]string, 0, len(entries))
-		for _, e := range entries {
-			if e.IsDir() {
-				names = append(names, e.Name())
-			}
-		}
-		sort.Strings(names)
-		imported := 0
-		for _, name := range names {
-			if maxRegular > 0 && imported >= maxRegular {
-				break
-			}
-			setDir := filepath.Join(regularDir, name)
-			if err := s.importStickerSetDir(ctx, setDir, "", order, force, stats); err != nil {
-				return fmt.Errorf("import sticker set %s: %w", name, err)
-			}
-			order++
-			imported++
-		}
-	}
-	return nil
+// seedStickerSetEntry is a sticker set after parsing one export directory. The whole export tree is
+// read/parsed once: document integrity checks and the import both reuse it, no longer re-reading
+// set_info.json for every path.
+type seedStickerSetEntry struct {
+	dir       string
+	systemKey string
+	info      seedStickerSetInfoJSON
 }
 
-func (s *Service) importStickerSetDir(ctx context.Context, setDir, systemKey string, order int, force bool, stats *SeedStats) error {
-	infoPath := filepath.Join(setDir, "set_info.json")
-	raw, err := os.ReadFile(infoPath)
-	if err != nil {
-		return nil // 该目录无 set_info.json → 跳过
-	}
-	var info struct {
-		InputSetType string                   `json:"input_set_type"`
-		Result       seedStickerSetResultJSON `json:"result"`
-	}
-	if err := json.Unmarshal(raw, &info); err != nil {
-		return fmt.Errorf("parse %s: %w", infoPath, err)
-	}
-	sj := info.Result.Set
-	if sj.ID == 0 {
-		return nil
-	}
-	if systemKey == "" {
-		systemKey = systemKeyForInputSetType(info.InputSetType)
-	}
-	kind := stickerSetKind(sj, systemKey)
-	// 增量 seed：集已存在且内容 hash 未变则跳过（不重读文档/重传 blob）。force 时强制重导
-	// （缩略图内联缓存修复路径）。这让 seedStickerSets 可在非空 store 上每次启动安全重扫,
-	// 仅导入新增/变更集；但系统集分类由导出元数据决定，旧库中 hash 相同但 system_key/kind
-	// 错误的记录必须重写，避免 constructor 方式取不到同一个资源集。
-	existing, found, err := s.media.GetStickerSetByID(ctx, sj.ID)
+type seedStickerSetInfoJSON struct {
+	InputSetType string                   `json:"input_set_type"`
+	Result       seedStickerSetResultJSON `json:"result"`
+}
+
+func (s *Service) seedStickerSets(ctx context.Context, root string, maxRegular int, force bool, stats *SeedStats) error {
+	entries, err := readSeedStickerSetEntries(root, maxRegular)
 	if err != nil {
 		return err
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	// Validate only the export directory's own documents: thumbnails in user-created sticker sets are not
+	// the seed's responsibility, and counting them in the corruption check would force a full re-import of
+	// all seed sets on every startup.
+	if !force {
+		ids := make([]int64, 0, len(entries)*8)
+		for _, entry := range entries {
+			for _, dj := range entry.info.Result.Documents {
+				ids = append(ids, dj.ID)
+			}
+		}
+		stale, err := s.documentsNeedSeedRepair(ctx, ids)
+		if err != nil {
+			return err
+		}
+		force = stale
+	}
+	// Fetch existing sets in one go (4 queries), replacing per-set GetStickerSetByID (65 round-trips).
+	existing, err := s.listStickerSetsByID(ctx)
+	if err != nil {
+		return err
+	}
+	for order, entry := range entries {
+		if err := s.importStickerSet(ctx, entry, order, force, existing, stats); err != nil {
+			return fmt.Errorf("import sticker set %s: %w", filepath.Base(entry.dir), err)
+		}
+	}
+	return s.saveStickerSeedIndex(ctx, root, maxRegular, entries)
+}
+
+const (
+	seedStickerIndexKey     = "files.sticker_seed_index"
+	seedStickerIndexVersion = 3
+)
+
+// seedStickerSeedIndex records the export tree's stat fingerprint and all its document ids: at steady
+// state startup set_info.json need not be parsed, and documentsNeedSeedRepair can still verify whether
+// those documents' thumbnails/blobs are present.
+type seedStickerSeedIndex struct {
+	Version        int     `json:"version"`
+	DC             int     `json:"dc"`
+	MaxRegularSets int     `json:"max_regular_sets"` // <=0 is stored as 0 uniformly; raising the limit requires a rescan.
+	Fingerprint    string  `json:"fingerprint"`
+	Sets           []int64 `json:"sets"`
+	Documents      []int64 `json:"documents"`
+}
+
+func (s *Service) loadStickerSeedIndex(ctx context.Context) (seedStickerSeedIndex, bool, error) {
+	raw, found, err := s.media.GetSeedState(ctx, seedStickerIndexKey)
+	if err != nil || !found || raw == "" {
+		return seedStickerSeedIndex{}, false, err
+	}
+	var idx seedStickerSeedIndex
+	if err := json.Unmarshal([]byte(raw), &idx); err != nil {
+		// Old format or corrupted: treat as no index and do a full scan rewrite.
+		return seedStickerSeedIndex{}, false, nil
+	}
+	return idx, true, nil
+}
+
+func (s *Service) saveStickerSeedIndex(ctx context.Context, root string, maxRegular int, entries []seedStickerSetEntry) error {
+	fingerprint, err := stickerSeedFingerprint(root)
+	if err != nil {
+		return err
+	}
+	seen := make(map[int64]struct{}, len(entries)*8)
+	ids := make([]int64, 0, len(entries)*8)
+	// The same set may appear in two export directories at once (e.g. a Topics emoji set); deduplicate by
+	// id before recording, otherwise the "set still exists" count on the next startup never matches and
+	// the fast path is skipped for nothing.
+	setSeen := make(map[int64]struct{}, len(entries))
+	setIDs := make([]int64, 0, len(entries))
+	for _, entry := range entries {
+		if id := entry.info.Result.Set.ID; id != 0 {
+			if _, ok := setSeen[id]; !ok {
+				setSeen[id] = struct{}{}
+				setIDs = append(setIDs, id)
+			}
+		}
+		for _, dj := range entry.info.Result.Documents {
+			if dj.ID == 0 {
+				continue
+			}
+			if _, ok := seen[dj.ID]; ok {
+				continue
+			}
+			seen[dj.ID] = struct{}{}
+			ids = append(ids, dj.ID)
+		}
+	}
+	encoded, err := json.Marshal(seedStickerSeedIndex{
+		Version:        seedStickerIndexVersion,
+		DC:             s.dc,
+		MaxRegularSets: max(0, maxRegular),
+		Fingerprint:    fingerprint,
+		Sets:           setIDs,
+		Documents:      ids,
+	})
+	if err != nil {
+		return err
+	}
+	return s.putSeedState(ctx, seedStickerIndexKey, string(encoded))
+}
+
+// stickerSeedFingerprint only stats set_info.json under the three export directories (without decoding
+// the content): a new set or a re-export changes the size/mtime, triggering a full scan; a missing
+// directory is treated as empty.
+func stickerSeedFingerprint(root string) (string, error) {
+	h := sha256.New()
+	for _, base := range []string{
+		"telegram_default_stickers_export",
+		"telegram_emoji_export",
+		"telegram_stickers_export",
+	} {
+		dir := filepath.Join(root, base)
+		names, err := seedSubdirNames(dir)
+		if err != nil {
+			return "", err
+		}
+		// seedSubdirNames is sorted; only stat <set>/set_info.json without descending into documents/
+		// (which has tens of thousands of small files, where walking dirents on a cold disk costs hundreds of milliseconds).
+		for _, name := range names {
+			info, err := os.Stat(filepath.Join(dir, name, "set_info.json"))
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				return "", err
+			}
+			_, _ = fmt.Fprintf(h, "%s/%s\x00%d\x00%d\n", base, name, info.Size(), info.ModTime().UnixNano())
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// readSeedStickerSetEntries collects export directories in the order default → emoji → regular, with
+// regular limited by maxRegular. The order is the sort_order.
+func readSeedStickerSetEntries(root string, maxRegular int) ([]seedStickerSetEntry, error) {
+	var entries []seedStickerSetEntry
+	appendDir := func(dir, systemKey string) error {
+		infoPath := filepath.Join(dir, "set_info.json")
+		raw, err := os.ReadFile(infoPath)
+		if err != nil {
+			return nil // this directory has no set_info.json → skip
+		}
+		var info seedStickerSetInfoJSON
+		if err := json.Unmarshal(raw, &info); err != nil {
+			return fmt.Errorf("parse %s: %w", infoPath, err)
+		}
+		if info.Result.Set.ID == 0 {
+			return nil
+		}
+		if systemKey == "" {
+			systemKey = systemKeyForInputSetType(info.InputSetType)
+		}
+		entries = append(entries, seedStickerSetEntry{dir: dir, systemKey: systemKey, info: info})
+		return nil
+	}
+	appendKind := func(base string, defaultSets bool, limit int) error {
+		names, err := seedSubdirNames(base)
+		if err != nil {
+			return err
+		}
+		for i, name := range names {
+			if limit > 0 && i >= limit {
+				break
+			}
+			// Default system sets: directory name → system_key; other sets are inferred from input_set_type in appendDir.
+			systemKey := ""
+			if defaultSets {
+				systemKey = systemKeyForDefaultSet(name)
+			}
+			if err := appendDir(filepath.Join(base, name), systemKey); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := appendKind(filepath.Join(root, "telegram_default_stickers_export"), true, 0); err != nil {
+		return nil, err
+	}
+	// custom-emoji sets (telegram_emoji_export/<set>/): not limited by maxRegular, classified as
+	// StickerSetKindEmoji by the set_info emojis flag (delivered via getEmojiStickers/getFeaturedEmojiStickers).
+	if err := appendKind(filepath.Join(root, "telegram_emoji_export"), false, 0); err != nil {
+		return nil, err
+	}
+	// Regular sticker sets.
+	if err := appendKind(filepath.Join(root, "telegram_stickers_export"), false, maxRegular); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+func seedSubdirNames(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			names = append(names, entry.Name())
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// listStickerSetsByID fetches all non-deleted sets in one go.
+func (s *Service) listStickerSetsByID(ctx context.Context) (map[int64]domain.StickerSet, error) {
+	out := make(map[int64]domain.StickerSet, 64)
+	for _, kind := range []domain.StickerSetKind{
+		domain.StickerSetKindStickers,
+		domain.StickerSetKindEmoji,
+		domain.StickerSetKindMasks,
+		domain.StickerSetKindSystem,
+	} {
+		sets, err := s.media.ListStickerSets(ctx, kind)
+		if err != nil {
+			return nil, err
+		}
+		for _, set := range sets {
+			out[set.ID] = set
+		}
+	}
+	return out, nil
+}
+
+func (s *Service) importStickerSet(ctx context.Context, entry seedStickerSetEntry, order int, force bool, existingSets map[int64]domain.StickerSet, stats *SeedStats) error {
+	info := entry.info
+	sj := info.Result.Set
+	systemKey := entry.systemKey
+	kind := stickerSetKind(sj, systemKey)
+	// Incremental seed: when a set already exists and its content hash is unchanged, skip it (without
+	// re-reading documents or re-uploading blobs). force forces a re-import (the inline thumbnail cache
+	// repair path). This lets seedStickerSets safely rescan on every startup over a non-empty store,
+	// importing only new/changed sets; but system set classification is determined by the export
+	// metadata, so records with the same hash but a wrong system_key/kind in an old DB must be rewritten,
+	// so that the same resource set cannot be fetched via a constructor.
+	existing, found := existingSets[sj.ID]
+	if !found {
+		var err error
+		existing, found, err = s.media.GetStickerSetByID(ctx, sj.ID)
+		if err != nil {
+			return err
+		}
 	}
 	if found {
 		// Source exports may come from different accounts. Once published locally,
@@ -329,7 +551,7 @@ func (s *Service) importStickerSetDir(ctx context.Context, setDir, systemKey str
 			return nil
 		}
 	}
-	stickersDir := filepath.Join(setDir, "stickers")
+	stickersDir := filepath.Join(entry.dir, "stickers")
 	index, err := scanSeedDir(stickersDir)
 	if err != nil {
 		return err
@@ -357,7 +579,7 @@ func (s *Service) importStickerSetDir(ctx context.Context, setDir, systemKey str
 		Hash:            sj.Hash,
 		Kind:            kind,
 		Official:        sj.Official,
-		Animated:        true, // 导出资源均为 .tgs 动画贴纸
+		Animated:        true, // exported resources are all .tgs animated stickers
 		Emojis:          sj.Emojis,
 		Masks:           sj.Masks,
 		Archived:        sj.Archived,
@@ -377,12 +599,14 @@ func (s *Service) importStickerSetDir(ctx context.Context, setDir, systemKey str
 	if err := s.media.PutStickerSet(ctx, set); err != nil {
 		return err
 	}
+	// The same id may appear in a later export directory; the skip decision must see the version just imported this round.
+	existingSets[set.ID] = set
 	s.stickerSetCache.put(set, docs)
 	stats.StickerSets++
 	return nil
 }
 
-// ---- 单个 document 导入 ----
+// ---- Single document import ----
 
 func (s *Service) importDocument(ctx context.Context, dj seedDocumentJSON, binDir string, index seedDirIndex, owner domain.StickerSetRef, stats *SeedStats) (domain.Document, error) {
 	if dj.ID == 0 {
@@ -408,7 +632,7 @@ func (s *Service) importDocument(ctx context.Context, dj seedDocumentJSON, binDi
 		return domain.Document{}, fmt.Errorf("document %d sticker reference: %w", dj.ID, err)
 	}
 
-	// 主体 blob：doc:<document-id>
+	// Main blob: doc:<document-id>
 	if mainPath, ok := index.main[dj.ID]; ok {
 		data, err := os.ReadFile(mainPath)
 		if err != nil {
@@ -431,13 +655,15 @@ func (s *Service) importDocument(ctx context.Context, dj seedDocumentJSON, binDi
 		stats.Blobs++
 	}
 
-	// 缩略图保留两类并存（与官方 sticker 一致）：
-	//   - PhotoPathSize 矢量轮廓：随 document 元数据内联下发，是 TDesktop 对 animated
-	//     sticker 在完整 .tgs 下载完成前唯一可即时渲染的占位（history_view_sticker 显式
-	//     禁用了 stripped 内联占位，cached 字节又经 RPC 出口转成 downloadable）；丢掉它会让
-	//     打开会话时 sticker 先空白、并多触发一次缩略图 getFile。
-	//   - 小 PhotoSize 静态图：写 blob 并暂存为 PhotoCachedSize（RPC 出口再转 downloadable
-	//     photoSize m），供 sticker 面板等需要小缩略图的场景下载。
+	// Thumbnails keep both kinds coexisting (consistent with official stickers):
+	//   - PhotoPathSize vector outline: delivered inline with the document metadata, it is the only
+	//     placeholder TDesktop can render immediately for an animated sticker before the full .tgs
+	//     download completes (history_view_sticker explicitly disables the stripped inline placeholder,
+	//     and cached bytes are converted to downloadable at the RPC egress); dropping it makes the
+	//     sticker blank on opening a session and triggers an extra thumbnail getFile.
+	//   - Small PhotoSize static image: write a blob and stash it as PhotoCachedSize (converted to
+	//     downloadable photoSize m at the RPC egress), for scenarios needing a small thumbnail such as
+	//     the sticker panel.
 	thumbs := make([]domain.PhotoSize, 0, len(dj.Thumbs))
 	for _, tj := range dj.Thumbs {
 		ps, downloadable := seedPhotoSize(tj)
@@ -447,7 +673,7 @@ func (s *Service) importDocument(ctx context.Context, dj seedDocumentJSON, binDi
 		if downloadable {
 			thumbPath, ok := index.thumb[dj.ID][ps.Type]
 			if !ok {
-				continue // 无可服务的缩略图文件，丢弃该尺寸（保留 PhotoPathSize 占位）
+				continue // no serviceable thumbnail file, drop this size (keep the PhotoPathSize placeholder)
 			}
 			data, err := os.ReadFile(thumbPath)
 			if err != nil {
@@ -525,11 +751,11 @@ func (s *Service) prewarmSmallBlob(objectKey string, data []byte) {
 	}
 }
 
-// ---- 目录扫描：docID → 主体文件 / 可下载缩略图 ----
+// ---- Directory scan: docID → main file / downloadable thumbnail ----
 
 type seedDirIndex struct {
-	main  map[int64]string            // docID -> 主体文件路径
-	thumb map[int64]map[string]string // docID -> thumbType -> 缩略图文件路径
+	main  map[int64]string            // docID -> main file path
+	thumb map[int64]map[string]string // docID -> thumbType -> thumbnail file path
 }
 
 var seedTrailingDigits = regexp.MustCompile(`(\d{6,})`)
@@ -543,7 +769,7 @@ func scanSeedDir(dir string) (seedDirIndex, error) {
 	idx := seedDirIndex{main: map[int64]string{}, thumb: map[int64]map[string]string{}}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return idx, nil // 目录不存在 → 空 index
+		return idx, nil // directory missing → empty index
 	}
 	for _, e := range entries {
 		if e.IsDir() {
@@ -553,7 +779,7 @@ func scanSeedDir(dir string) (seedDirIndex, error) {
 		ext := strings.ToLower(filepath.Ext(name))
 		full := filepath.Join(dir, name)
 		if marker := seedThumbMarker.FindStringIndex(name); marker != nil {
-			// 只收可下载的 PhotoSize 缩略图（jpg）；PhotoPathSize(svg) 内联在 JSON。
+			// Collect only downloadable PhotoSize thumbnails (jpg); PhotoPathSize(svg) is inline in the JSON.
 			if ext != ".jpg" && ext != ".jpeg" {
 				continue
 			}
@@ -583,7 +809,7 @@ func scanSeedDir(dir string) (seedDirIndex, error) {
 	return idx, nil
 }
 
-// docIDFromName 取 base name 中末尾最长的数字串作为 document id。
+// docIDFromName takes the longest trailing digit run in the base name as the document id.
 func docIDFromName(base string) int64 {
 	matches := seedTrailingDigits.FindAllString(base, -1)
 	if len(matches) == 0 {
@@ -671,7 +897,7 @@ func seedStickerSetInstalled(kind domain.StickerSetKind) bool {
 	return false
 }
 
-// ---- JSON → domain 转换 ----
+// ---- JSON → domain conversion ----
 
 func seedDocumentAttributes(attrs []seedAttrJSON) []domain.DocumentAttribute {
 	out := make([]domain.DocumentAttribute, 0, len(attrs))
@@ -879,25 +1105,6 @@ func seedThumbMimeType(data []byte) string {
 	}
 }
 
-func (s *Service) stickerSetDocumentsNeedSeedRepair(ctx context.Context) (bool, error) {
-	var ids []int64
-	for _, kind := range []domain.StickerSetKind{
-		domain.StickerSetKindStickers,
-		domain.StickerSetKindEmoji,
-		domain.StickerSetKindMasks,
-		domain.StickerSetKindSystem,
-	} {
-		sets, err := s.media.ListStickerSets(ctx, kind)
-		if err != nil {
-			return false, err
-		}
-		for _, set := range sets {
-			ids = append(ids, set.DocumentIDs...)
-		}
-	}
-	return s.documentsNeedSeedRepair(ctx, ids)
-}
-
 func (s *Service) documentsNeedInlineCachedThumbs(ctx context.Context, ids []int64) (bool, error) {
 	return s.documentsNeedSeedRepair(ctx, ids)
 }
@@ -918,27 +1125,28 @@ func (s *Service) documentsNeedSeedRepair(ctx context.Context, ids []int64) (boo
 		seen[id] = struct{}{}
 		unique = append(unique, id)
 	}
-	docs, err := s.media.GetDocuments(ctx, unique)
+	// Fetch only the thumbnail validation metadata, not the document body: seed documents' thumbs inline
+	// thousands of base64 thumbnail bytes, GetDocuments takes 2-3s on a slow machine, while here only
+	// kind/size/file header are needed.
+	states, err := s.media.SeedThumbStates(ctx, unique)
 	if err != nil {
 		return false, err
 	}
-	for _, doc := range docs {
-		for _, thumb := range doc.Thumbs {
-			if thumb.Kind == domain.PhotoSizeKindDefault && thumb.Size > 0 && thumb.Size <= seedInlineCachedDocumentThumbMaxBytes {
+	for _, state := range states {
+		switch domain.PhotoSizeKind(state.Kind) {
+		case domain.PhotoSizeKindDefault:
+			if state.DeclaredSize > 0 && state.DeclaredSize <= seedInlineCachedDocumentThumbMaxBytes {
 				return true, nil
 			}
-			if thumb.Kind == domain.PhotoSizeKindCached && len(thumb.Bytes) > 0 {
-				blob, ok, err := s.media.GetFileBlob(ctx, fmt.Sprintf("doc:%d:%s", doc.ID, thumb.Type))
-				if err != nil {
-					return false, err
-				}
-				if !ok {
-					return true, nil
-				}
-				want := seedThumbMimeType(thumb.Bytes)
-				if blob.Size != int64(len(thumb.Bytes)) || (want != "application/octet-stream" && blob.MimeType != want) {
-					return true, nil
-				}
+		case domain.PhotoSizeKindCached:
+			if state.DataSize == 0 {
+				continue
+			}
+			if !state.HasBlob || state.BlobSize != int64(state.DataSize) {
+				return true, nil
+			}
+			if want := seedThumbMimeType(state.Head); want != "application/octet-stream" && state.BlobMime != want {
+				return true, nil
 			}
 		}
 	}
@@ -980,7 +1188,7 @@ func derefInt64(v *int64) int64 {
 	return *v
 }
 
-// ---- seed JSON 结构 ----
+// ---- seed JSON structures ----
 
 type seedInputStickerSetJSON struct {
 	ID         int64 `json:"id"`

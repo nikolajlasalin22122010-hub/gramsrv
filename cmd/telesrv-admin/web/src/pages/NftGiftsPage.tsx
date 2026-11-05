@@ -1,7 +1,6 @@
 import { Gem, RefreshCw, Search, Store, Wallet } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api, errorMessage } from "../api";
-import { SectionTabs } from "../components/SectionTabs";
 import { Alert, Badge, EmptyRow, Metric, PageFrame, QueryPanel } from "../components/ui";
 import { useI18n } from "../i18n";
 import { displayUsername, formatDate } from "../lib/format";
@@ -87,7 +86,6 @@ export function NftGiftsPage({ navigate }: { navigate: Navigate }) {
         </>
       }
     >
-      <SectionTabs sectionId="nft" active="/nft-gifts" navigate={navigate} />
       {error && <Alert>{error}</Alert>}
       <div className="metric-row">
         <Metric label={t("nft.metricLoaded")} value={String(rows.length)} />

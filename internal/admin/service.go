@@ -266,9 +266,9 @@ type UserLookup interface {
 type StarsService interface {
 	Credit(ctx context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, title, desc string) (domain.StarsBalance, error)
 	Debit(ctx context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, title, desc string) (domain.StarsBalance, error)
-	// CountStarsAllUsers 返回批量贷记的候选真实用户数（dry-run 预览用）。
+	// CountStarsAllUsers returns the number of real-user candidates for the bulk credit (used by the dry-run preview).
 	CountStarsAllUsers(ctx context.Context) (int64, error)
-	// GrantStarsAll 给所有真实用户批量贷记 amount，返回受影响账号数。
+	// GrantStarsAll bulk-credits amount to all real users and returns the number of affected accounts.
 	GrantStarsAll(ctx context.Context, amount int64, title, desc string) (int64, error)
 }
 
@@ -888,7 +888,7 @@ type ImportStarGiftRequest struct {
 	PerUserTotal int `json:"per_user_total,omitempty"`
 
 	// Optional lifecycle authoring for the auction panel and scheduled-release
-	// ("отложенный дроп") surfaces. Zero values describe an ordinary gift.
+	// ("scheduled drop") surfaces. Zero values describe an ordinary gift.
 	// Validated by domain.StarGiftCatalogWrite.ValidateLifecycleAuthoring.
 	// For auctions Stars is the starting/minimum bid and AvailabilityTotal is
 	// the supply; AuctionRoundDuration is seconds (0 => engine default).
@@ -1047,8 +1047,9 @@ type GrantStarsRequest struct {
 	Amount int64 `json:"amount"`
 }
 
-// GrantStarsAllRequest 是全量发星请求：给所有真实用户（非机器人、非系统账号）各贷记
-// Amount 颗星。无 user_id——目标由 store 层从 users 表一次性解析。
+// GrantStarsAllRequest is the grant-stars-to-all request: it credits Amount stars to every real
+// user (non-bot, non-system account). There is no user_id -- the targets are resolved at once by
+// the store layer from the users table.
 type GrantStarsAllRequest struct {
 	CommandMeta
 	Amount int64 `json:"amount"`
@@ -1927,8 +1928,9 @@ func (s *Service) GrantStars(ctx context.Context, req GrantStarsRequest) (Comman
 	})
 }
 
-// GrantStarsAll 给所有真实用户批量贷记 Amount 颗星。dry-run 只统计候选数不动账；
-// 真实执行在单个事务内完成余额+流水，返回受影响账号数（不逐个通知客户端，量级太大）。
+// GrantStarsAll bulk-credits Amount stars to all real users. A dry run only counts the candidates
+// without moving funds; the actual execution completes balance + ledger in a single transaction and
+// returns the number of affected accounts (clients are not notified one by one -- the volume is too large).
 func (s *Service) GrantStarsAll(ctx context.Context, req GrantStarsAllRequest) (CommandResult, error) {
 	if req.Amount <= 0 || req.Amount > maxStarsGrant {
 		return CommandResult{}, fmt.Errorf("amount must be between 1 and %d", maxStarsGrant)
@@ -4070,7 +4072,7 @@ func (s *Service) ImportOfficialStarGift(ctx context.Context, req ImportOfficial
 		req.SlugPrefix = "official-" + req.SourceGiftID
 	}
 
-	// Scheduled release ("отложенный дроп") for a snapshot gift. The snapshot's own
+	// Scheduled release ("scheduled drop") for a snapshot gift. The snapshot's own
 	// locked_until_date records Telegram's release window, which is normally long
 	// past by the time the gift is mirrored here, so it cannot serve as a local
 	// schedule. An operator-supplied time therefore wins, and must be in the future
@@ -4085,9 +4087,9 @@ func (s *Service) ImportOfficialStarGift(ctx context.Context, req ImportOfficial
 	}
 
 	// Auctions require finite inventory. For ordinary gifts, the base catalog is
-	// finite only when the operator sets a base limit ("Лимит подарков"): any
+	// finite only when the operator sets a base limit ("Gift limit"): any
 	// positive value makes the base gift a limited edition of that exact size.
-	// The collectible supply ("уникальный тираж") configures the pool alone and
+	// The collectible supply ("unique supply") configures the pool alone and
 	// must never turn a regular gift into a limited one.
 	limited, availabilityTotal := false, 0
 	if bundle.Gift.Auction {
@@ -4291,7 +4293,8 @@ func officialRarity(value officialgifts.Rarity) (domain.StarGiftAttributeRarityK
 		return "", 0, domain.ErrStarGiftCollectibleInvalid
 	}
 	if kind == domain.StarGiftRarityPermille {
-		if value.Permille == nil || *value.Permille <= 0 || *value.Permille > 1000 {
+		// permille 0 is a valid weight (the attribute stays in the pool but is never drawn), matching the official snapshot.
+		if value.Permille == nil || *value.Permille < 0 || *value.Permille > 1000 {
 			return "", 0, domain.ErrStarGiftCollectibleInvalid
 		}
 		return kind, *value.Permille, nil
@@ -4666,6 +4669,99 @@ func isSafeStickerPreviewImageType(value string) bool {
 	default:
 		return false
 	}
+}
+
+// maxLiveMediaBytes caps one live-review media read. A message can carry a
+// multi-GB document, so the read is bounded. The panel renders only photos as
+// an <img>; a document is a download link the operator has to click.
+const maxLiveMediaBytes = 16 << 20
+
+// ErrLiveMediaTooLarge reports a live-review media object above
+// maxLiveMediaBytes. LiveMedia returns it from a size probe, before reading the
+// object, so the caller can tell "too large" apart from "not found".
+var ErrLiveMediaTooLarge = errors.New("live media is larger than 16 MiB")
+
+// LiveMedia returns the bytes behind a media location key for the live review
+// console. The MIME type is sniffed from the bytes, never taken from the
+// uploader: raster images and playable video/audio keep their type, everything
+// else is reported as application/octet-stream so it can never execute as
+// active content on the panel origin.
+func (s *Service) LiveMedia(ctx context.Context, locationKey string) ([]byte, string, bool, error) {
+	if s == nil || s.photos == nil || locationKey == "" {
+		return nil, "", false, nil
+	}
+	if !safeLiveMediaKey(locationKey) {
+		return nil, "", false, nil
+	}
+	// Photos/documents store sized variants ("photo:<id>:x", "doc:<id>:m");
+	// try the bare key first, then the known suffixes. Each candidate is probed
+	// with a one-byte read, which reports the object's total size without
+	// reading its body, so an oversized object is rejected before any large
+	// read.
+	var key string
+	var total int64
+	for _, candidate := range []string{locationKey, locationKey + ":x", locationKey + ":m", locationKey + ":c", locationKey + ":a"} {
+		probe, ok, err := s.photos.GetFile(ctx, domain.FileDownloadRequest{LocationKey: candidate, Limit: 1})
+		if err != nil {
+			return nil, "", false, err
+		}
+		if ok {
+			key, total = candidate, probe.Total
+			break
+		}
+	}
+	if key == "" || total <= 0 {
+		return nil, "", false, nil
+	}
+	if total > maxLiveMediaBytes {
+		return nil, "", false, ErrLiveMediaTooLarge
+	}
+	chunk, found, err := s.photos.GetFile(ctx, domain.FileDownloadRequest{LocationKey: key, Limit: int(total)})
+	if err != nil {
+		return nil, "", false, err
+	}
+	if !found || chunk.Total != total || int64(len(chunk.Bytes)) != chunk.Total {
+		return nil, "", false, nil
+	}
+	detected := http.DetectContentType(chunk.Bytes)
+	switch {
+	case safeLiveMediaImageType(detected), safeLiveMediaPlaybackType(detected):
+		return chunk.Bytes, detected, true, nil
+	default:
+		return chunk.Bytes, "application/octet-stream", true, nil
+	}
+}
+
+// safeLiveMediaKey limits a media lookup to the known location-key namespaces
+// (photo/document/blob) and their characters, so the key can not be an
+// arbitrary path or a crafted value.
+func safeLiveMediaKey(key string) bool {
+	switch {
+	case strings.HasPrefix(key, "photo:"), strings.HasPrefix(key, "doc:"), strings.HasPrefix(key, "blob:"):
+	default:
+		return false
+	}
+	for _, r := range key {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == ':', r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return len(key) <= 512
+}
+
+func safeLiveMediaImageType(value string) bool {
+	switch value {
+	case "image/webp", "image/png", "image/jpeg", "image/gif":
+		return true
+	default:
+		return false
+	}
+}
+
+func safeLiveMediaPlaybackType(value string) bool {
+	return value == "video/mp4" || strings.HasPrefix(value, "audio/")
 }
 
 func (s *Service) GifCatalog(ctx context.Context) ([]domain.GifCatalogEntry, error) {

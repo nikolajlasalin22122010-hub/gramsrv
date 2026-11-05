@@ -3,15 +3,19 @@ package files
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/jpeg"
 	"image/png"
+	"reflect"
 	"testing"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 func TestCreateDocumentFromUploadNormalizesGIFToGIFv(t *testing.T) {
@@ -355,10 +359,12 @@ func TestCreateAvatarMarkupGeneratesDownloadableStaticSizes(t *testing.T) {
 	assertDownloadableAvatarSize(t, svc, photo.ID, "c", 640)
 }
 
-// TestCreateAvatarMarkupComposesEmojiThumbIntoStaticSizes 守护两个行为：
-//  1. 普通彩色 emoji 合成进静态头像时保留原色（不得染白/变黑）；
-//  2. 贴图含非满 alpha 像素（抗锯齿常态）时不得因预乘溢出整片变黑——曾因把
-//     R=G=B=255、A<255 的非法预乘值喂给 draw.Over 溢出回绕，emoji 输出近黑色。
+// TestCreateAvatarMarkupComposesEmojiThumbIntoStaticSizes guards two behaviors:
+//  1. A regular color emoji composed into a static avatar keeps its original color (must not be
+//     whitened/blackened);
+//  2. An overlay with non-full alpha pixels (the norm for anti-aliasing) must not turn whole-black
+//     from premultiplication overflow — feeding the illegal R=G=B=255, A<255 premultiplied value to
+//     draw.Over once overflowed and wrapped, outputting the emoji as near-black.
 func TestCreateAvatarMarkupComposesEmojiThumbIntoStaticSizes(t *testing.T) {
 	ctx := context.Background()
 	media := newFakeMediaStore()
@@ -400,8 +406,9 @@ func TestCreateAvatarMarkupComposesEmojiThumbIntoStaticSizes(t *testing.T) {
 	}
 }
 
-// TestCreateAvatarMarkupTintsTextColorEmojiWhite 守护 text_color custom emoji 的
-// 白色剪影呈现：染色必须写合法预乘值（R=G=B=A），非满 alpha 像素不得溢出变黑。
+// TestCreateAvatarMarkupTintsTextColorEmojiWhite guards the white-silhouette presentation of a
+// text_color custom emoji: tinting must write legal premultiplied values (R=G=B=A), and non-full
+// alpha pixels must not overflow into black.
 func TestCreateAvatarMarkupTintsTextColorEmojiWhite(t *testing.T) {
 	ctx := context.Background()
 	media := newFakeMediaStore()
@@ -501,8 +508,9 @@ func TestCreateAvatarVideoMarkupGeneratesDownloadableStaticSizes(t *testing.T) {
 	}
 }
 
-// TestCreateAvatarVideoMarkupFallsBackToVideoFirstFrame 守护 markup document/thumb
-// 不可用时仍可从上传视频抽帧，不能让普通动画头像失去静态尺寸。
+// TestCreateAvatarVideoMarkupFallsBackToVideoFirstFrame guards that a frame can still be extracted
+// from the uploaded video when the markup document/thumb is unavailable, so an ordinary animated
+// avatar does not lose its static sizes.
 func TestCreateAvatarVideoMarkupFallsBackToVideoFirstFrame(t *testing.T) {
 	ctx := context.Background()
 	media := newFakeMediaStore()
@@ -592,9 +600,10 @@ func TestCreateAvatarVideoMarkupRejectsDegeneratePreviewAndFallsBackToVideo(t *t
 	}
 }
 
-// TestCreateAvatarVideoMarkupPrefersComposedStill 守护 DrKLO emoji 构造器边界：
-// 客户端生成 MP4 的第一帧可能只有渐变背景；只要 markup thumb 可解析，静态头像
-// 必须用服务端合成结果，确保 emoji 在当前 session 回显和冷启动中都可见。
+// TestCreateAvatarVideoMarkupPrefersComposedStill guards the boundary of the DrKLO emoji builder:
+// the first frame of the client-generated MP4 may contain only a gradient background; as long as
+// the markup thumb resolves, the static avatar must use the server-composed result, ensuring the
+// emoji is visible both in the current session echo and on a cold start.
 func TestCreateAvatarVideoMarkupPrefersComposedStill(t *testing.T) {
 	ctx := context.Background()
 	media := newFakeMediaStore()
@@ -672,8 +681,9 @@ func assertAvatarImageSize(t *testing.T, svc *Service, photoID int64, sizeType s
 	}
 }
 
-// testTransparentThumbPNG 构造红色方块贴图：周边透明、中心 alpha=250（模拟抗锯齿
-// 的非满 alpha），用于守护预乘溢出回归——溢出代码会把 alpha≠255 的像素整片渲染成黑。
+// testTransparentThumbPNG builds a red square overlay: transparent around the edges, center
+// alpha=250 (simulating anti-aliased non-full alpha), used to guard the premultiplication overflow
+// regression — the overflowing code renders every pixel with alpha≠255 whole-black.
 func testTransparentThumbPNG(t *testing.T) []byte {
 	t.Helper()
 	img := image.NewNRGBA(image.Rect(0, 0, 64, 64))
@@ -727,4 +737,318 @@ func testJPEG(t *testing.T, w, h int) []byte {
 		t.Fatalf("encode jpeg: %v", err)
 	}
 	return buf.Bytes()
+}
+
+func TestEnsureAvatarPhotoCreatesSeparateAvatarForMessagePhoto(t *testing.T) {
+	ctx := context.Background()
+	media := newFakeMediaStore()
+	blobs, err := NewLocalFS(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewLocalFS: %v", err)
+	}
+	svc := NewService(media, blobs, 2)
+
+	source, err := svc.CreatePhotoFromBytes(ctx, testJPEG(t, 640, 480))
+	if err != nil {
+		t.Fatalf("CreatePhotoFromBytes: %v", err)
+	}
+	if hasAvatarSizes(source) {
+		t.Fatalf("message photo sizes = %+v, want no avatar sizes", source.Sizes)
+	}
+
+	avatar, err := svc.EnsureAvatarPhoto(ctx, source)
+	if err != nil {
+		t.Fatalf("EnsureAvatarPhoto: %v", err)
+	}
+	if avatar.ID == source.ID || avatar.ID == 0 || avatar.AccessHash == 0 {
+		t.Fatalf("avatar id=%d access_hash=%d, want a new photo distinct from %d", avatar.ID, avatar.AccessHash, source.ID)
+	}
+	gotTypes := make([]string, 0, len(avatar.Sizes))
+	for _, size := range avatar.Sizes {
+		gotTypes = append(gotTypes, size.Type)
+		blob, found, err := media.GetFileBlob(ctx, fmt.Sprintf("photo:%d:%s", avatar.ID, size.Type))
+		if err != nil || !found {
+			t.Fatalf("avatar blob %s found=%v err=%v", size.Type, found, err)
+		}
+		data, err := blobs.Get(ctx, blob.ObjectKey)
+		if err != nil || len(data) != size.Size {
+			t.Fatalf("avatar blob %s len=%d err=%v, want %d bytes", size.Type, len(data), err, size.Size)
+		}
+	}
+	if !reflect.DeepEqual(gotTypes, []string{"s", "a", "c"}) {
+		t.Fatalf("avatar size types = %v, want [s a c]", gotTypes)
+	}
+	if c := avatar.Sizes[2]; c.W != 640 || c.H != 480 {
+		t.Fatalf("avatar c = %dx%d, want the 640x480 source", c.W, c.H)
+	}
+	stored, found, err := media.GetPhoto(ctx, avatar.ID)
+	if err != nil || !found || !reflect.DeepEqual(stored, avatar) {
+		t.Fatalf("stored avatar = %+v found=%v err=%v, want %+v", stored, found, err, avatar)
+	}
+
+	storedSource, found, err := media.GetPhoto(ctx, source.ID)
+	if err != nil || !found {
+		t.Fatalf("source photo found=%v err=%v", found, err)
+	}
+	if !reflect.DeepEqual(storedSource, source) {
+		t.Fatalf("source photo row = %+v, want unchanged %+v", storedSource, source)
+	}
+	for _, sizeType := range []string{"s", "a", "c"} {
+		if _, found, _ := media.GetFileBlob(ctx, fmt.Sprintf("photo:%d:%s", source.ID, sizeType)); found {
+			t.Fatalf("source photo gained blob %s", sizeType)
+		}
+	}
+
+	photoCount := len(media.photos)
+	again, err := svc.EnsureAvatarPhoto(ctx, avatar)
+	if err != nil {
+		t.Fatalf("EnsureAvatarPhoto(avatar): %v", err)
+	}
+	if !reflect.DeepEqual(again, avatar) || len(media.photos) != photoCount {
+		t.Fatalf("EnsureAvatarPhoto(avatar) = %+v with %d photos, want the same photo and %d photos", again, len(media.photos), photoCount)
+	}
+}
+
+func TestEnsureAvatarPhotoRendersFromLargestStoredSize(t *testing.T) {
+	ctx := context.Background()
+	media := newFakeMediaStore()
+	blobs, err := NewLocalFS(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewLocalFS: %v", err)
+	}
+	svc := NewService(media, blobs, 2)
+
+	const photoID = int64(8101)
+	small := testJPEG(t, 320, 240)
+	large := testJPEG(t, 1280, 960)
+	putTestPhotoBlob(t, media, blobs, photoID, "m", small)
+	putTestPhotoBlob(t, media, blobs, photoID, "y", large)
+	// 'a' without 'c' is not a usable avatar either.
+	source := domain.Photo{ID: photoID, AccessHash: 8102, DCID: 2, Sizes: []domain.PhotoSize{
+		{Kind: domain.PhotoSizeKindDefault, Type: "m", W: 320, H: 240, Size: len(small)},
+		{Kind: domain.PhotoSizeKindProgressive, Type: "y", W: 1280, H: 960, Sizes: []int{len(large)}},
+		{Kind: domain.PhotoSizeKindDefault, Type: "a", W: 160, H: 160, Size: 100},
+	}}
+
+	avatar, err := svc.EnsureAvatarPhoto(ctx, source)
+	if err != nil {
+		t.Fatalf("EnsureAvatarPhoto: %v", err)
+	}
+	if avatar.ID == source.ID || len(avatar.Sizes) != 3 {
+		t.Fatalf("avatar = %+v, want a new photo with s/a/c", avatar)
+	}
+	if c := avatar.Sizes[2]; c.Type != "c" || c.W != 1280 || c.H != 960 {
+		t.Fatalf("avatar c = %+v, want 1280x960 from the largest size", c)
+	}
+}
+
+func TestEnsureAvatarPhotoFallsBackToCachedBytes(t *testing.T) {
+	ctx := context.Background()
+	media := newFakeMediaStore()
+	blobs, err := NewLocalFS(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewLocalFS: %v", err)
+	}
+	svc := NewService(media, blobs, 2)
+
+	cached := testJPEG(t, 90, 90)
+	source := domain.Photo{ID: 8201, AccessHash: 8202, DCID: 2, Sizes: []domain.PhotoSize{
+		{Kind: domain.PhotoSizeKindStripped, Type: "i", Bytes: []byte{1, 2, 3}},
+		{Kind: domain.PhotoSizeKindCached, Type: "s", W: 90, H: 90, Bytes: cached},
+	}}
+	avatar, err := svc.EnsureAvatarPhoto(ctx, source)
+	if err != nil {
+		t.Fatalf("EnsureAvatarPhoto: %v", err)
+	}
+	if avatar.ID == source.ID || len(avatar.Sizes) != 3 || avatar.Sizes[2].W != 90 || avatar.Sizes[2].H != 90 {
+		t.Fatalf("avatar = %+v, want a new 90x90 avatar", avatar)
+	}
+}
+
+func TestEnsureAvatarPhotoSkipsSourcesOverTheCaps(t *testing.T) {
+	ctx := context.Background()
+	media := newFakeMediaStore()
+	local, err := NewLocalFS(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewLocalFS: %v", err)
+	}
+	blobs := &countingBlobBackend{BlobBackend: local}
+	svc := NewService(media, blobs, 2)
+
+	const photoID = int64(8301)
+	if err := media.PutFileBlob(ctx, domain.FileBlob{
+		LocationKey: fmt.Sprintf("photo:%d:w", photoID),
+		Backend:     domain.MediaBackendLocalFS,
+		ObjectKey:   "missing",
+		Size:        avatarSourceMaxBytes + 1,
+	}); err != nil {
+		t.Fatalf("PutFileBlob: %v", err)
+	}
+	putTestPhotoBlob(t, media, local, photoID, "x", testPNGHeader(t, 6000, 5000))
+	small := testJPEG(t, 320, 240)
+	putTestPhotoBlob(t, media, local, photoID, "m", small)
+	source := domain.Photo{ID: photoID, AccessHash: 8302, DCID: 2, Sizes: []domain.PhotoSize{
+		{Kind: domain.PhotoSizeKindDefault, Type: "m", W: 320, H: 240, Size: len(small)},
+		{Kind: domain.PhotoSizeKindDefault, Type: "x", W: 6000, H: 5000, Size: 64},
+		{Kind: domain.PhotoSizeKindDefault, Type: "w", W: 8000, H: 6000, Size: 1024},
+	}}
+
+	avatar, err := svc.EnsureAvatarPhoto(ctx, source)
+	if err != nil {
+		t.Fatalf("EnsureAvatarPhoto: %v", err)
+	}
+	if c := avatar.Sizes[2]; c.W != 320 || c.H != 240 {
+		t.Fatalf("avatar c = %dx%d, want 320x240 from 'm' after skipping 'w' and 'x'", c.W, c.H)
+	}
+	// 'x' and 'm' are read; the oversized 'w' is not.
+	if calls := blobs.getRangeCalls.Load(); calls != 2 {
+		t.Fatalf("GetRange calls = %d, want 2", calls)
+	}
+
+	cached := testJPEG(t, 90, 90)
+	cachedOnly := domain.Photo{ID: 8303, AccessHash: 8304, DCID: 2, Sizes: []domain.PhotoSize{
+		{Kind: domain.PhotoSizeKindCached, Type: "x", W: 6000, H: 5000, Bytes: testPNGHeader(t, 6000, 5000)},
+		{Kind: domain.PhotoSizeKindCached, Type: "s", W: 90, H: 90, Bytes: cached},
+	}}
+	avatar, err = svc.EnsureAvatarPhoto(ctx, cachedOnly)
+	if err != nil {
+		t.Fatalf("EnsureAvatarPhoto(cached): %v", err)
+	}
+	if c := avatar.Sizes[2]; c.W != 90 || c.H != 90 {
+		t.Fatalf("cached avatar c = %dx%d, want 90x90 after skipping the oversized cached size", c.W, c.H)
+	}
+}
+
+func TestEnsureAvatarPhotoRejectsUnusableSource(t *testing.T) {
+	ctx := context.Background()
+	storageErr := errors.New("media store down")
+	tests := []struct {
+		name    string
+		blob    func(t *testing.T, media *fakeMediaStore, blobs BlobBackend, photoID int64)
+		failGet bool
+		noRead  bool
+		wantErr error
+	}{
+		{name: "no stored image", wantErr: domain.ErrPhotoInvalid},
+		{
+			name: "not an image",
+			blob: func(t *testing.T, media *fakeMediaStore, blobs BlobBackend, photoID int64) {
+				putTestPhotoBlob(t, media, blobs, photoID, "x", []byte("not an image"))
+			},
+			wantErr: domain.ErrPhotoInvalid,
+		},
+		{
+			name: "too many pixels",
+			blob: func(t *testing.T, media *fakeMediaStore, blobs BlobBackend, photoID int64) {
+				putTestPhotoBlob(t, media, blobs, photoID, "x", testPNGHeader(t, 6000, 5000))
+			},
+			wantErr: domain.ErrPhotoInvalid,
+		},
+		{
+			// The object does not exist, so reading it would also fail.
+			name: "blob over the size cap",
+			blob: func(t *testing.T, media *fakeMediaStore, _ BlobBackend, photoID int64) {
+				if err := media.PutFileBlob(ctx, domain.FileBlob{
+					LocationKey: fmt.Sprintf("photo:%d:x", photoID),
+					Backend:     domain.MediaBackendLocalFS,
+					ObjectKey:   "missing",
+					Size:        avatarSourceMaxBytes + 1,
+				}); err != nil {
+					t.Fatalf("PutFileBlob: %v", err)
+				}
+			},
+			noRead:  true,
+			wantErr: domain.ErrPhotoInvalid,
+		},
+		{name: "storage error", failGet: true, wantErr: storageErr},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			media := newFakeMediaStore()
+			local, err := NewLocalFS(t.TempDir())
+			if err != nil {
+				t.Fatalf("NewLocalFS: %v", err)
+			}
+			blobs := &countingBlobBackend{BlobBackend: local}
+			const photoID = int64(8001)
+			if tt.blob != nil {
+				tt.blob(t, media, local, photoID)
+			}
+			var mediaStore store.MediaStore = media
+			if tt.failGet {
+				mediaStore = &failingBlobMediaStore{fakeMediaStore: media, err: storageErr}
+			}
+			svc := NewService(mediaStore, blobs, 2)
+			source := domain.Photo{ID: photoID, AccessHash: 8002, DCID: 2, Sizes: []domain.PhotoSize{
+				{Kind: domain.PhotoSizeKindStripped, Type: "i", Bytes: []byte{1, 2, 3}},
+				{Kind: domain.PhotoSizeKindDefault, Type: "x", W: 6000, H: 5000, Size: 1024},
+			}}
+			if err := media.PutPhoto(ctx, source); err != nil {
+				t.Fatalf("PutPhoto: %v", err)
+			}
+			blobCount := len(media.blobs)
+
+			if _, err := svc.EnsureAvatarPhoto(ctx, source); !errors.Is(err, tt.wantErr) {
+				t.Fatalf("EnsureAvatarPhoto err = %v, want %v", err, tt.wantErr)
+			}
+			if tt.noRead && blobs.getRangeCalls.Load() != 0 {
+				t.Fatalf("read %d ranges of an oversized blob, want none", blobs.getRangeCalls.Load())
+			}
+			if len(media.photos) != 1 || len(media.blobs) != blobCount {
+				t.Fatalf("store has %d photos and %d blobs, want only the source photo and %d blobs", len(media.photos), len(media.blobs), blobCount)
+			}
+		})
+	}
+}
+
+func TestAvatarSourceDecodableCapsPixels(t *testing.T) {
+	if !avatarSourceDecodable(testPNGHeader(t, 5000, 5000)) {
+		t.Fatal("5000x5000 rejected, want it within avatarSourceMaxPixels")
+	}
+	if avatarSourceDecodable(testPNGHeader(t, 6000, 5000)) {
+		t.Fatal("6000x5000 accepted, want it over avatarSourceMaxPixels")
+	}
+}
+
+type failingBlobMediaStore struct {
+	*fakeMediaStore
+	err error
+}
+
+func (f *failingBlobMediaStore) GetFileBlob(context.Context, string) (domain.FileBlob, bool, error) {
+	return domain.FileBlob{}, false, f.err
+}
+
+func putTestPhotoBlob(t *testing.T, media *fakeMediaStore, blobs BlobBackend, photoID int64, sizeType string, data []byte) {
+	t.Helper()
+	objectKey, err := blobs.Put(context.Background(), data)
+	if err != nil {
+		t.Fatalf("blobs.Put: %v", err)
+	}
+	if err := media.PutFileBlob(context.Background(), domain.FileBlob{
+		LocationKey: fmt.Sprintf("photo:%d:%s", photoID, sizeType),
+		Backend:     domain.MediaBackendLocalFS,
+		ObjectKey:   objectKey,
+		Size:        int64(len(data)),
+		MimeType:    "image/jpeg",
+	}); err != nil {
+		t.Fatalf("PutFileBlob: %v", err)
+	}
+}
+
+// testPNGHeader returns a PNG signature and IHDR chunk only: image.DecodeConfig reports w x h,
+// but there is no pixel data to decode.
+func testPNGHeader(t *testing.T, w, h int) []byte {
+	t.Helper()
+	var ihdr bytes.Buffer
+	ihdr.WriteString("IHDR")
+	_ = binary.Write(&ihdr, binary.BigEndian, uint32(w))
+	_ = binary.Write(&ihdr, binary.BigEndian, uint32(h))
+	ihdr.Write([]byte{8, 2, 0, 0, 0}) // 8-bit RGB, default compression/filter, no interlace
+	var out bytes.Buffer
+	out.WriteString("\x89PNG\r\n\x1a\n")
+	_ = binary.Write(&out, binary.BigEndian, uint32(ihdr.Len()-4))
+	out.Write(ihdr.Bytes())
+	_ = binary.Write(&out, binary.BigEndian, crc32.ChecksumIEEE(ihdr.Bytes()))
+	return out.Bytes()
 }

@@ -549,6 +549,21 @@ func TestTDesktopPassiveChannelStubs(t *testing.T) {
 		t.Fatalf("telemetry=%+v moderation=%+v, want separate durable streams",
 			events, moderationReports.Reports())
 	}
+	// Clients report one message once per view and may still hold metrics
+	// for a local (unsent) message id: both are accepted, not MSG_ID_INVALID.
+	metric := func(msgID int, viewID int64) tg.InputMessageReadMetric {
+		return tg.InputMessageReadMetric{MsgID: msgID, ViewID: viewID, TimeInViewMs: 10, ActiveTimeInViewMs: 10,
+			HeightToViewportRatioPermille: 1000, SeenRangeRatioPermille: 1000}
+	}
+	if ok, err := r.onMessagesReportReadMetrics(ownerCtx, &tg.MessagesReportReadMetricsRequest{
+		Peer:    inputPeerChannel(channel),
+		Metrics: []tg.InputMessageReadMetric{metric(1, 100), metric(1, 101), metric(-3, 102)},
+	}); err != nil || !ok {
+		t.Fatalf("messages.reportReadMetrics repeated/local ids = ok %v err %v, want true nil", ok, err)
+	}
+	if events := telemetryEvents.Events(); len(events) != 3 || len(events[2].SubjectIDs) != 1 || events[2].SubjectIDs[0] != 1 {
+		t.Fatalf("repeated read metrics telemetry = %+v, want one event for message 1", events)
+	}
 	if ok, err := r.onMessagesReportMusicListen(ownerCtx, &tg.MessagesReportMusicListenRequest{
 		ID:               &tg.InputDocument{ID: 1, AccessHash: 2},
 		ListenedDuration: 1,
@@ -763,13 +778,13 @@ func TestTDesktopPassiveChannelStubs(t *testing.T) {
 	}); err == nil || !strings.Contains(err.Error(), "LIMIT_INVALID") {
 		t.Fatalf("messages.searchStickers huge limit err = %v, want LIMIT_INVALID", err)
 	}
-	// emoji 关键词已从官方 seed(catalog),返回真实词典而非空 stub。
+	// emoji keywords come from the official seed (catalog), returning a real dictionary rather than an empty stub.
 	keywords, err := r.onMessagesGetEmojiKeywords(ownerCtx, "en")
 	if err != nil || keywords.LangCode != "en" || keywords.Version == 0 || len(keywords.Keywords) == 0 {
 		t.Fatalf("messages.getEmojiKeywords lang=%q version=%d count=%d err=%v, want seeded en keywords",
 			keywords.LangCode, keywords.Version, len(keywords.Keywords), err)
 	}
-	// 客户端版本(7)落后于固化版本 → 下发全量,Version 推进到固化版本。
+	// The client version (7) is behind the pinned version -> send the full set, and Version advances to the pinned version.
 	keywordsDiff, err := r.onMessagesGetEmojiKeywordsDifference(ownerCtx, &tg.MessagesGetEmojiKeywordsDifferenceRequest{
 		LangCode:    "en",
 		FromVersion: 7,
@@ -903,7 +918,7 @@ func TestTDesktopPassiveChannelStubs(t *testing.T) {
 		t.Fatalf("messages.getDefaultTagReactions = %#v, want non-empty hashable catalog", tagReactions)
 	}
 	r.deps.Messages = nil
-	// poll 链路已是真实现：对非 poll 消息一律 MESSAGE_ID_INVALID（与官方一致）。
+	// The poll path is now a real implementation: for non-poll messages it is uniformly MESSAGE_ID_INVALID (matching the official API).
 	if _, err := r.onMessagesSendVote(ownerCtx, &tg.MessagesSendVoteRequest{
 		Peer:    inputPeerChannel(channel),
 		MsgID:   1,

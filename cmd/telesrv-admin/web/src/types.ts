@@ -1360,3 +1360,23 @@ export type MarketLotRow = {
   price: number;
   status: string;
 };
+export type LiveChatRow = {
+  PeerType: string;
+  PeerID: number;
+  TopMessageID: number;
+  TopMessageDate: number;
+  UnreadCount: number;
+};
+
+export type LiveChatListResponse = {
+  user_id: number;
+  chats: LiveChatRow[];
+  has_more: boolean;
+};
+
+
+export type LivePeerNames = {
+  users: Record<string, string>;
+  channels: Record<string, string>;
+};
+

@@ -2,14 +2,16 @@ package files
 
 import "encoding/binary"
 
-// faststartMP4 把 MP4 的 moov 原子移到 mdat 之前（faststart），并把 moov 内所有
-// stco/co64 chunk 偏移整体加上 moov 的大小（因为 moov 插到 mdat 前会把媒体数据整体后移）。
-// 返回 (newData, changed)。非 MP4 / 已 faststart / 任何解析异常时返回 (data, false) 原样，
-// 绝不破坏数据——这是上传热路径，宁可不优化也不能把好视频改坏。
+// faststartMP4 moves the MP4 moov atom before mdat (faststart) and adds the moov size to every
+// stco/co64 chunk offset inside moov (inserting moov before mdat shifts all media data later).
+// It returns (newData, changed). For non-MP4 / already-faststart / any parse error it returns
+// (data, false) unchanged -- this is the upload hot path, so it is better to skip the optimization
+// than to corrupt a good video.
 //
-// 背景：TDesktop 的 story 流式播放路径无法处理 moov 在文件末尾的视频（av_read_frame
-// 报 Invalid data），普通 Telegram 客户端上传前会 faststart。telesrv 在落盘前补这一步，
-// 让 supports_streaming=true 的承诺对所有客户端成立。不转码、保留原编码（含 HEVC）。
+// Background: TDesktop's story streaming path cannot handle videos whose moov is at the end of the
+// file (av_read_frame reports Invalid data), and ordinary Telegram clients faststart before upload.
+// telesrv performs this step before writing to disk so the supports_streaming=true promise holds for
+// all clients. No transcoding; the original encoding (including HEVC) is preserved.
 func faststartMP4(data []byte) ([]byte, bool) {
 	boxes, ok := parseTopLevelBoxes(data)
 	if !ok {
@@ -32,7 +34,7 @@ func faststartMP4(data []byte) ([]byte, bool) {
 			}
 		}
 	}
-	// 必须有 ftyp(且在最前)、moov、mdat；moov 已在 mdat 前则已 faststart。
+	// Must have ftyp (and first), moov, mdat; if moov is already before mdat it is already faststart.
 	if ftypIdx != 0 || moovIdx < 0 || firstMdatIdx < 0 {
 		return data, false
 	}
@@ -40,14 +42,14 @@ func faststartMP4(data []byte) ([]byte, bool) {
 		return data, false
 	}
 
-	// 拷出 moov（独立底层数组，后续就地改偏移不影响原 data）。
+	// Copy out moov (independent backing array, so patching offsets in place does not touch the original data).
 	moov := append([]byte(nil), data[boxes[moovIdx].start:boxes[moovIdx].end]...)
 	moovSize := int64(len(moov))
 	if !patchChunkOffsets(moov, moovSize) {
 		return data, false
 	}
 
-	// 重组：ftyp + moov + 其余 box（除 ftyp/moov）按原顺序。
+	// Reassemble: ftyp + moov + the remaining boxes (except ftyp/moov) in their original order.
 	out := make([]byte, 0, len(data))
 	out = append(out, data[boxes[ftypIdx].start:boxes[ftypIdx].end]...)
 	out = append(out, moov...)
@@ -58,31 +60,32 @@ func faststartMP4(data []byte) ([]byte, bool) {
 		out = append(out, data[b.start:b.end]...)
 	}
 	if len(out) != len(data) {
-		// 长度必须守恒（只搬不改大小）；不守恒说明哪里算错，保守放弃。
+		// Length must be conserved (we only move, never resize); if it is not, something was miscomputed, so bail out conservatively.
 		return data, false
 	}
 	return out, true
 }
 
-// mp4Layout 是只读 box 头得出的顶层结构信息，用于在不读取整段媒体的前提下判断是否需要
-// faststart 以及如何流式重写。
+// mp4Layout is top-level structure info derived from reading only box headers, used to decide
+// whether faststart is needed and how to rewrite the stream without reading the entire media.
 type mp4Layout struct {
-	needsFaststart       bool  // moov 在 mdat 之后
-	moovIsLast           bool  // moov 是最后一个顶层 box（可走流式重写）
-	ftypStart, ftypEnd   int64
-	moovStart, moovEnd   int64
+	needsFaststart     bool // moov comes after mdat
+	moovIsLast         bool // moov is the last top-level box (streaming rewrite is possible)
+	ftypStart, ftypEnd int64
+	moovStart, moovEnd int64
 }
 
-// inspectMP4Layout 只读顶层 box 头（每个 ≤16 字节，跳过 box 负载）来判定结构，避免为了
-// 「检查是否已 faststart」而把整段视频读进内存。readAt(off, n) 读取 [off, off+n) 字节。
-// 非 MP4 / 结构异常返回 (·, false)。
+// inspectMP4Layout reads only the top-level box headers (each <=16 bytes, skipping box payloads) to
+// determine the structure, avoiding reading the whole video into memory just to check whether it is
+// already faststart. readAt(off, n) reads bytes [off, off+n). For non-MP4 / malformed structure it
+// returns (·, false).
 func inspectMP4Layout(size int64, readAt func(off, n int64) ([]byte, error)) (mp4Layout, bool) {
 	l := mp4Layout{moovStart: -1, moovEnd: -1}
 	mdatStart := int64(-1)
 	ftypSeen := false
 	p := int64(0)
 	for boxes := 0; p+8 <= size; boxes++ {
-		if boxes > 1024 { // 顶层 box 数量上限，防御异常文件
+		if boxes > 1024 { // top-level box count cap, defending against malformed files
 			return mp4Layout{}, false
 		}
 		hdr, err := readAt(p, 16)
@@ -106,7 +109,7 @@ func inspectMP4Layout(size int64, readAt func(off, n int64) ([]byte, error)) (mp
 		switch typ {
 		case "ftyp":
 			if p != 0 {
-				return mp4Layout{}, false // ftyp 必须在最前
+				return mp4Layout{}, false // ftyp must come first
 			}
 			ftypSeen = true
 			l.ftypStart, l.ftypEnd = p, p+boxSize
@@ -134,7 +137,7 @@ type boxRef struct {
 	start, end int
 }
 
-// parseTopLevelBoxes 顺序解析顶层 box，要求恰好无缝覆盖整个 data，否则视为非法不处理。
+// parseTopLevelBoxes parses top-level boxes in order, requiring them to exactly and seamlessly cover all of data; otherwise it is treated as invalid and left alone.
 func parseTopLevelBoxes(data []byte) ([]boxRef, bool) {
 	var boxes []boxRef
 	p := 0
@@ -163,12 +166,12 @@ func parseTopLevelBoxes(data []byte) ([]boxRef, bool) {
 	return boxes, true
 }
 
-// patchChunkOffsets 递归进入 moov 的容器 box，把 stco/co64 的每个偏移 += delta。
+// patchChunkOffsets recurses into moov's container boxes and adds delta to every stco/co64 offset.
 func patchChunkOffsets(box []byte, delta int64) bool {
 	if len(box) < 8 {
 		return false
 	}
-	p := 8 // 跳过自身 box 头（moov 用 32 位 size，极少 64 位；若 64 位则下面 walk 仍从 8 起会错→由调用方 moov 头守恒保证）
+	p := 8 // skip its own box header (moov uses a 32-bit size, rarely 64-bit; a 64-bit size would make the walk below starting at 8 wrong -> guaranteed by the caller's moov header being conserved)
 	for p+8 <= len(box) {
 		size := int(binary.BigEndian.Uint32(box[p : p+4]))
 		typ := string(box[p+4 : p+8])
@@ -206,7 +209,7 @@ func patchChunkOffsets(box []byte, delta int64) bool {
 	return true
 }
 
-// patchStco：stco = [size(4)][type(4)][version+flags(4)][entry_count(4)][offsets 4*count]。
+// patchStco: stco = [size(4)][type(4)][version+flags(4)][entry_count(4)][offsets 4*count].
 func patchStco(box []byte, delta int64) bool {
 	if len(box) < 16 {
 		return false
@@ -224,7 +227,7 @@ func patchStco(box []byte, delta int64) bool {
 	return true
 }
 
-// patchCo64：co64 entries 为 8 字节。
+// patchCo64: co64 entries are 8 bytes.
 func patchCo64(box []byte, delta int64) bool {
 	if len(box) < 16 {
 		return false
@@ -240,4 +243,88 @@ func patchCo64(box []byte, delta int64) bool {
 		off += 8
 	}
 	return true
+}
+
+// mp4TrackKinds reads the mdia/hdlr handler_type of each trak inside a moov box (including the box
+// header) and reports whether a video track (vide) and audio track (soun) exist. ok=false means the
+// structure could not be fully parsed and the caller should keep the classification from the client.
+func mp4TrackKinds(moov []byte) (hasVideo, hasAudio, ok bool) {
+	boxes, ok := parseTopLevelBoxes(moov)
+	if !ok || len(boxes) != 1 || boxes[0].typ != "moov" {
+		return false, false, false
+	}
+	children, ok := childBoxes(moov, boxes[0])
+	if !ok {
+		return false, false, false
+	}
+	for _, trak := range children {
+		if trak.typ != "trak" {
+			continue
+		}
+		handler, ok := trakHandler(moov, trak)
+		if !ok {
+			return false, false, false
+		}
+		switch handler {
+		case "vide":
+			hasVideo = true
+		case "soun":
+			hasAudio = true
+		}
+	}
+	return hasVideo, hasAudio, true
+}
+
+// trakHandler returns the handler_type of trak/mdia/hdlr.
+func trakHandler(data []byte, trak boxRef) (string, bool) {
+	children, ok := childBoxes(data, trak)
+	if !ok {
+		return "", false
+	}
+	for _, mdia := range children {
+		if mdia.typ != "mdia" {
+			continue
+		}
+		parts, ok := childBoxes(data, mdia)
+		if !ok {
+			return "", false
+		}
+		for _, hdlr := range parts {
+			if hdlr.typ != "hdlr" {
+				continue
+			}
+			// hdlr payload: version/flags(4) + pre_defined(4) + handler_type(4) + ...
+			payload := data[hdlr.start+boxHeaderSize(data, hdlr) : hdlr.end]
+			if len(payload) < 12 {
+				return "", false
+			}
+			return string(payload[8:12]), true
+		}
+	}
+	return "", false
+}
+
+// childBoxes parses the child boxes of a container box, with offsets relative to data.
+func childBoxes(data []byte, parent boxRef) ([]boxRef, bool) {
+	start := parent.start + boxHeaderSize(data, parent)
+	if start > parent.end {
+		return nil, false
+	}
+	children, ok := parseTopLevelBoxes(data[start:parent.end])
+	if !ok {
+		return nil, false
+	}
+	for i := range children {
+		children[i].start += start
+		children[i].end += start
+	}
+	return children, true
+}
+
+// boxHeaderSize is the box header length: 16 bytes for largesize (size==1), otherwise 8 bytes.
+func boxHeaderSize(data []byte, b boxRef) int {
+	if binary.BigEndian.Uint32(data[b.start:b.start+4]) == 1 {
+		return 16
+	}
+	return 8
 }
