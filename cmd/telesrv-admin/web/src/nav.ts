@@ -79,6 +79,12 @@ export type NavSection = {
 
 export const navSections: NavSection[] = [
   {
+    id: "payments",
+    labelKey: "layout.payments",
+    icon: Wallet,
+    tabs: [{ path: "/payments", labelKey: "layout.payments", permission: permissionServerManage }]
+  },
+  {
     id: "overview",
     labelKey: "layout.dashboard",
     icon: LayoutDashboard,

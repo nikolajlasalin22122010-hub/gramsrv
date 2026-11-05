@@ -122,14 +122,17 @@ func (locale premiumBotLocale) help() string {
 const premiumGiftPeerButtonID = 7101
 
 const (
-	premiumCallbackPrefix  = "premium:"
-	premiumCallbackPlans   = premiumCallbackPrefix + "plans"
-	premiumCallbackGift    = premiumCallbackPrefix + "gift"
-	premiumCallbackStatus  = premiumCallbackPrefix + "status"
-	premiumCallbackHistory = premiumCallbackPrefix + "history"
-	premiumCallbackTerms   = premiumCallbackPrefix + "terms"
-	premiumCallbackBuy     = premiumCallbackPrefix + "buy:"
-	premiumCallbackGiftBuy = premiumCallbackPrefix + "gift-buy:"
+	premiumCallbackPrefix   = "premium:"
+	premiumCallbackPlans    = premiumCallbackPrefix + "plans"
+	premiumCallbackGift     = premiumCallbackPrefix + "gift"
+	premiumCallbackStatus   = premiumCallbackPrefix + "status"
+	premiumCallbackHistory  = premiumCallbackPrefix + "history"
+	premiumCallbackTerms    = premiumCallbackPrefix + "terms"
+	premiumCallbackBuy      = premiumCallbackPrefix + "buy:"
+	premiumCallbackGiftBuy  = premiumCallbackPrefix + "gift-buy:"
+	premiumCallbackTopUp    = premiumCallbackPrefix + "topup"
+	premiumCallbackTopUpBuy = premiumCallbackPrefix + "topup-buy:"
+	premiumCallbackTopUpPay = premiumCallbackPrefix + "topup-pay:"
 )
 
 func (s *Service) respondAsPremium(botUserID, userID int64, msg domain.Message, session domain.ClientSessionMetadata) {
@@ -201,6 +204,8 @@ func (s *Service) handlePremium(ctx context.Context, userID int64, body string, 
 		return premiumBotTerms(locale)
 	case "help", "":
 		return s.premiumBotHome(locale.help(), locale)
+	case "topup", "stars":
+		return s.premiumBotTopUp(ctx, userID, locale)
 	case "deposit":
 		return s.premiumBotDepositReply(ctx, userID)
 	default:
@@ -239,6 +244,7 @@ func (s *Service) premiumBotHome(text string, locales ...premiumBotLocale) botRe
 			Inline: [][]domain.MarkupButton{
 				{button(locale.text("Купить Premium", "Buy Premium"), premiumCallbackPlans), button(locale.text("Подарить Premium", "Gift Premium"), premiumCallbackGift)},
 				{button(locale.text("Мой Premium", "My Premium"), premiumCallbackStatus), button(locale.text("История покупок", "Purchase history"), premiumCallbackHistory)},
+				{button(locale.text("Пополнить звёзды", "Top up Stars"), premiumCallbackTopUp)},
 				{button(locale.text("Условия", "Terms"), premiumCallbackTerms)},
 			},
 		},
@@ -592,6 +598,15 @@ func (s *Service) premiumBotStatus(ctx context.Context, userID int64, locales ..
 			expiresAt = entitlement.ExpiresAt
 		}
 	}
+	// Registration grants (TELESRV_PREMIUM_GRANT_MONTHS) and the admin
+	// fallback path write users.premium_expires_at without creating an
+	// entitlement, so the client showed Premium while this bot saw nothing.
+	// Fall back to the same aggregate the rest of the server trusts.
+	if expiresAt <= now && s.users != nil {
+		if u, found, err := s.users.ByID(ctx, userID); err == nil && found && int(u.PremiumUntil) > expiresAt {
+			expiresAt = int(u.PremiumUntil)
+		}
+	}
 	if expiresAt <= now {
 		return s.premiumBotPlans(ctx, locale.text("Premium не активен. Выберите тариф:", "Premium is not active. Choose a plan:"), locale)
 	}
@@ -620,6 +635,8 @@ func (s *Service) onPremiumCallback(
 		reply = s.premiumBotStatus(ctx, userID, locale)
 	case premiumCallbackHistory:
 		reply = s.premiumBotHistory(ctx, userID, locale)
+	case premiumCallbackTopUp:
+		reply = s.premiumBotTopUp(ctx, userID, locale)
 	case premiumCallbackTerms:
 		reply = premiumBotTerms(locale)
 	default:
@@ -630,6 +647,23 @@ func (s *Service) onPremiumCallback(
 				return premiumBotCallbackExpired(locale), true, nil
 			}
 			reply = s.premiumBotInvoice(ctx, userID, months, locale)
+		case strings.HasPrefix(data, premiumCallbackTopUpBuy):
+			stars, err := strconv.ParseInt(strings.TrimPrefix(data, premiumCallbackTopUpBuy), 10, 64)
+			if err != nil || stars <= 0 {
+				return premiumBotCallbackExpired(locale), true, nil
+			}
+			reply = s.premiumBotTopUpInvoice(ctx, userID, stars, locale)
+		case strings.HasPrefix(data, premiumCallbackTopUpPay):
+			rest := strings.TrimPrefix(data, premiumCallbackTopUpPay)
+			provider, starsText, ok := strings.Cut(rest, ":")
+			stars, starsErr := strconv.ParseInt(starsText, 10, 64)
+			if !ok || starsErr != nil || stars <= 0 {
+				return premiumBotCallbackExpired(locale), true, nil
+			}
+			if s.paymentInvoices == nil || !s.paymentInvoices.ProviderConfigured(ctx, provider) {
+				return premiumBotProviderDisabled(locale, provider), true, nil
+			}
+			reply = s.premiumBotTopUpPay(ctx, userID, provider, stars, locale)
 		case strings.HasPrefix(data, premiumCallbackGiftBuy):
 			payload := strings.TrimPrefix(data, premiumCallbackGiftBuy)
 			recipientText, monthsText, ok := strings.Cut(payload, ":")
@@ -655,4 +689,134 @@ func premiumBotCallbackExpired(locales ...premiumBotLocale) domain.BotCallbackAn
 		Alert:   true,
 		Message: locale.text("Кнопка устарела. Отправьте /start и попробуйте ещё раз.", "This button has expired. Send /start and try again."),
 	}
+}
+
+type premiumStarsPackage struct {
+	Stars int64
+	Price int64 // whole rubles
+}
+
+var premiumStarsPackages = []premiumStarsPackage{
+	{Stars: 100, Price: 199},
+	{Stars: 250, Price: 449},
+	{Stars: 500, Price: 849},
+	{Stars: 1000, Price: 1590},
+}
+
+func (s *Service) premiumBotTopUp(ctx context.Context, userID int64, locales ...premiumBotLocale) botReply {
+	locale := premiumLocaleArg(locales)
+	if s.paymentInvoices == nil || s.starsTopUp == nil {
+		return botReply{Text: locale.text(
+			"Пополнение звёзд временно недоступно.",
+			"Star top-up is temporarily unavailable.")}
+	}
+	balance := int64(0)
+	if b, err := s.starsTopUp.GetBalance(ctx, userID); err == nil {
+		balance = b.Balance
+	}
+	var text strings.Builder
+	text.WriteString(locale.text("Пополнение звёзд", "Top up Stars"))
+	text.WriteString("\n\n")
+	fmt.Fprintf(&text, locale.text("Текущий баланс: %d Stars.\n\n", "Current balance: %d Stars.\n\n"), balance)
+	text.WriteString(locale.text(
+		"Выберите пакет — оплата картой или кошельком через ЮMoney.",
+		"Choose a package — pay by card or wallet via YooMoney."))
+	rows := make([][]domain.MarkupButton, 0, len(premiumStarsPackages))
+	for _, pkg := range premiumStarsPackages {
+		rows = append(rows, []domain.MarkupButton{{
+			Type: domain.MarkupButtonCallback,
+			Text: fmt.Sprintf("%d Stars — %d ₽", pkg.Stars, pkg.Price),
+			Data: []byte(premiumCallbackTopUpBuy + strconv.FormatInt(pkg.Stars, 10)),
+		}})
+	}
+	return botReply{
+		Text: strings.TrimSpace(text.String()),
+		ReplyMarkup: &domain.MessageReplyMarkup{
+			Type:   domain.MessageReplyMarkupInline,
+			Inline: rows,
+		},
+	}
+}
+
+func (s *Service) premiumBotTopUpInvoice(ctx context.Context, userID, stars int64, locales ...premiumBotLocale) botReply {
+	locale := premiumLocaleArg(locales)
+	pkg, found := premiumStarsPackageByStars(stars)
+	if !found || s.paymentInvoices == nil {
+		return s.premiumBotTopUp(ctx, userID, locale)
+	}
+	button := func(label, provider string) domain.MarkupButton {
+		return domain.MarkupButton{
+			Type: domain.MarkupButtonCallback,
+			Text: label,
+			Data: []byte(premiumCallbackTopUpPay + provider + ":" + strconv.FormatInt(pkg.Stars, 10)),
+		}
+	}
+	return botReply{
+		Text: fmt.Sprintf(locale.text(
+			"Пакет: %d Stars за %d ₽.\nВыберите способ оплаты:",
+			"Package: %d Stars for %d ₽.\nChoose a payment method:"), pkg.Stars, pkg.Price),
+		ReplyMarkup: &domain.MessageReplyMarkup{
+			Type: domain.MessageReplyMarkupInline,
+			Inline: [][]domain.MarkupButton{
+				{button(fmt.Sprintf(locale.text("Картой или кошельком — %d ₽", "Card or wallet — %d ₽"), pkg.Price), "yoomoney")},
+				{button(fmt.Sprintf(locale.text("Platega — %d ₽", "Platega — %d ₽"), pkg.Price), "platega")},
+			},
+		},
+	}
+}
+
+func (s *Service) premiumBotTopUpPay(ctx context.Context, userID int64, provider string, stars int64, locales ...premiumBotLocale) botReply {
+	locale := premiumLocaleArg(locales)
+	pkg, found := premiumStarsPackageByStars(stars)
+	if !found || s.paymentInvoices == nil {
+		return s.premiumBotTopUp(ctx, userID, locale)
+	}
+	payload := fmt.Sprintf("stars:%d:%d", userID, pkg.Stars)
+	title := fmt.Sprintf("%d Stars", pkg.Stars)
+	description := locale.text("Пополнение баланса звёзд", "Stars balance top-up")
+	var (
+		invoice domain.PaymentInvoice
+		err     error
+	)
+	switch provider {
+	case "platega":
+		invoice, err = s.paymentInvoices.CreatePlategaInvoice(ctx, domain.PremiumBotUserID, userID, pkg.Price*100, title, description, payload)
+	default:
+		invoice, err = s.paymentInvoices.CreateYooMoneyInvoice(ctx, domain.PremiumBotUserID, userID, pkg.Price*100, title, description, payload)
+	}
+	if err != nil || invoice.PaymentURL == "" {
+		return botReply{Text: locale.text(
+			"Не удалось создать счёт. Попробуйте позже.",
+			"Could not create the invoice. Please try again later.")}
+	}
+	return botReply{
+		Text: fmt.Sprintf(locale.text(
+			"Пакет: %d Stars за %d ₽.\nПосле оплаты звёзды зачислятся автоматически.",
+			"Package: %d Stars for %d ₽.\nStars are credited automatically after payment."), pkg.Stars, pkg.Price),
+		ReplyMarkup: &domain.MessageReplyMarkup{
+			Type: domain.MessageReplyMarkupInline,
+			Inline: [][]domain.MarkupButton{{
+				{Type: domain.MarkupButtonURL, Text: fmt.Sprintf(locale.text("Оплатить %d ₽", "Pay %d ₽"), pkg.Price), URL: invoice.PaymentURL},
+			}},
+		},
+	}
+}
+
+func premiumStarsPackageByStars(stars int64) (premiumStarsPackage, bool) {
+	for _, item := range premiumStarsPackages {
+		if item.Stars == stars {
+			return item, true
+		}
+	}
+	return premiumStarsPackage{}, false
+}
+
+func premiumBotProviderDisabled(locale premiumBotLocale, provider string) domain.BotCallbackAnswer {
+	name := "ЮMoney"
+	if provider == "platega" {
+		name = "Platega"
+	}
+	return domain.BotCallbackAnswer{Alert: true, Message: locale.text(
+		name+" пока не подключён. Попробуйте другой способ оплаты.",
+		name+" is not connected yet. Try another payment method.")}
 }

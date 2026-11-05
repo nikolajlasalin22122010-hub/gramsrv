@@ -1,4 +1,4 @@
-import { Gem, RefreshCw, Search, Wallet } from "lucide-react";
+import { Gem, RefreshCw, Search, Store, Wallet } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api, errorMessage } from "../api";
 import { SectionTabs } from "../components/SectionTabs";
@@ -7,6 +7,8 @@ import { useI18n } from "../i18n";
 import { displayUsername, formatDate } from "../lib/format";
 import type { Navigate } from "../routing";
 import type { UniqueStarGiftRow } from "../types";
+import { MarketLotModal } from "./MarketLotModal";
+import { MarketLotsPanel } from "./MarketLotsPanel";
 import { NftGiftWalletModal } from "./NftGiftWalletModal";
 
 const pageSize = "50";
@@ -18,6 +20,8 @@ const pageSize = "50";
 export function NftGiftsPage({ navigate }: { navigate: Navigate }) {
   const { t } = useI18n();
   const [rows, setRows] = useState<UniqueStarGiftRow[]>([]);
+  // Gift the operator clicked "На маркет" on, if any.
+  const [market, setMarket] = useState<UniqueStarGiftRow | null>(null);
   const [hasMore, setHasMore] = useState(false);
   const [cursor, setCursor] = useState("");
   const [q, setQ] = useState("");
@@ -103,6 +107,8 @@ export function NftGiftsPage({ navigate }: { navigate: Navigate }) {
         </form>
       </QueryPanel>
 
+      <MarketLotsPanel kind="gift" />
+
       <div className="table-wrap">
         <table className="data-table">
           <thead><tr>
@@ -153,6 +159,14 @@ export function NftGiftsPage({ navigate }: { navigate: Navigate }) {
                   >
                     <Wallet size={14} />
                   </button>
+                  <button
+                    className="row-link"
+                    type="button"
+                    onClick={() => setMarket(row)}
+                    title="Выставить этот подарок на маркет"
+                  >
+                    <Store size={14} /> На маркет
+                  </button>
                 </td>
               </tr>
             ))}
@@ -171,6 +185,20 @@ export function NftGiftsPage({ navigate }: { navigate: Navigate }) {
           gift={walletGift}
           onClose={() => { setWalletRef(null); setWalletGift(null); }}
           onApplied={() => void load(true)}
+        />
+      )}
+      {market && (
+        <MarketLotModal
+          kind="gift"
+          name={market.Title || market.Slug}
+          gift={{
+            slug: market.Slug,
+            collection: market.Title || market.Slug,
+            num: market.Num,
+            gift_id: Number(market.GiftID)
+          }}
+          onClose={() => setMarket(null)}
+          onDone={() => undefined}
         />
       )}
     </PageFrame>

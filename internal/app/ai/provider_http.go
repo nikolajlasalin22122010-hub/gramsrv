@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -291,11 +292,18 @@ func (p *HTTPProvider) composeOpenAIChatStream(ctx context.Context, req Provider
 }
 
 func (p *HTTPProvider) openAIChatBody(req ProviderRequest, stream bool) map[string]any {
+	// The user turn is a plain string for text-only requests (what every caller
+	// except the multimodal chat bot sends) and an array of parts when media is
+	// attached -- that is the shape OpenAI-compatible endpoints expect.
+	var userContent any = providerUserText(req)
+	if parts := providerUserParts(req); parts != nil {
+		userContent = parts
+	}
 	body := map[string]any{
 		"model": p.cfg.Model,
-		"messages": []map[string]string{
+		"messages": []map[string]any{
 			{"role": "system", "content": req.Instruction},
-			{"role": "user", "content": providerUserText(req)},
+			{"role": "user", "content": userContent},
 		},
 		"max_tokens": p.cfg.MaxOutputTokens,
 	}
@@ -307,6 +315,35 @@ func (p *HTTPProvider) openAIChatBody(req ProviderRequest, stream bool) map[stri
 		body["thinking"] = map[string]string{"type": p.cfg.Thinking}
 	}
 	return body
+}
+
+// providerUserParts renders attachments as OpenAI content parts, or nil when the
+// request carries no media (so the caller keeps sending a plain string).
+func providerUserParts(req ProviderRequest) []map[string]any {
+	attachments := req.Request.Attachments
+	if len(attachments) == 0 {
+		return nil
+	}
+	parts := []map[string]any{{"type": "text", "text": providerUserText(req)}}
+	for _, item := range attachments {
+		if item.Kind != domain.AIAttachmentImage || len(item.Data) == 0 {
+			continue
+		}
+		mime := item.MIME
+		if mime == "" {
+			mime = "image/jpeg"
+		}
+		parts = append(parts, map[string]any{
+			"type": "image_url",
+			"image_url": map[string]any{
+				"url": "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(item.Data),
+			},
+		})
+	}
+	if len(parts) == 1 {
+		return nil
+	}
+	return parts
 }
 
 func providerUserText(req ProviderRequest) string {

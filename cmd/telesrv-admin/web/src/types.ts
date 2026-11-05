@@ -1348,3 +1348,15 @@ export type GiftAttributesResponse = {
   patterns: GiftAttributeRow[];
   backdrops: GiftBackdropRow[];
 };
+
+// One active marketplace listing. Gifts carry collection/num instead of name.
+export type MarketLotRow = {
+  id: string;
+  kind?: string;
+  name?: string;
+  slug: string;
+  collection?: string;
+  num?: number;
+  price: number;
+  status: string;
+};

@@ -1,4 +1,4 @@
-import { AtSign, ChevronDown, ChevronRight, Flame, Loader2, Plus, RefreshCw, Search, Vault } from "lucide-react";
+import { AtSign, ChevronDown, ChevronRight, Flame, Loader2, Plus, RefreshCw, Search, Store, Vault } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api, errorMessage } from "../api";
 import { ActionButton } from "../components/ActionButton";
@@ -8,6 +8,8 @@ import { Alert, Badge, EmptyRow, Metric, PageFrame, QueryPanel, SectionHead } fr
 import { useI18n } from "../i18n";
 import { currencyExponent, displayUsername, formatCurrency, formatDate, toSmallestUnits } from "../lib/format";
 import type { Navigate } from "../routing";
+import { MarketLotModal } from "./MarketLotModal";
+import { MarketLotsPanel } from "./MarketLotsPanel";
 import type {
   AccountRow,
   ChannelRow,
@@ -29,6 +31,8 @@ export function CollectibleUsernamesPage({ navigate }: { navigate: Navigate }) {
   const [cursor, setCursor] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  // Market listing target: the username the operator clicked "На маркет" on.
+  const [market, setMarket] = useState<string | null>(null);
 
   // Mint form state.
   const [ownerKind, setOwnerKind] = useState<OwnerKind>("vault");
@@ -241,6 +245,8 @@ export function CollectibleUsernamesPage({ navigate }: { navigate: Navigate }) {
         </form>
       </QueryPanel>
 
+      <MarketLotsPanel kind="username" />
+
       <div className="table-wrap">
         <table className="data-table">
           <thead>
@@ -269,6 +275,13 @@ export function CollectibleUsernamesPage({ navigate }: { navigate: Navigate }) {
                   <button className="row-link" type="button" onClick={() => navigate(`/collectible-usernames/${row.ID}`)}>
                     <AtSign size={14} /> {t("common.detail")} <ChevronRight size={14} />
                   </button>
+                  <button
+                    className="row-link"
+                    type="button"
+                    onClick={() => setMarket(row.Username.replace(/^@/, ""))}
+                  >
+                    <Store size={14} /> На маркет
+                  </button>
                 </td>
               </tr>
             ))}
@@ -282,6 +295,14 @@ export function CollectibleUsernamesPage({ navigate }: { navigate: Navigate }) {
             {busy ? <Loader2 size={15} className="spin" /> : <ChevronDown size={15} />} {t("common.loadMore")}
           </button>
         </div>
+      )}
+      {market && (
+        <MarketLotModal
+          kind="username"
+          name={market}
+          onClose={() => setMarket(null)}
+          onDone={() => undefined}
+        />
       )}
     </PageFrame>
   );

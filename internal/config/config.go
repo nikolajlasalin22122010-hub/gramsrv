@@ -104,6 +104,23 @@ type Config struct {
 	AdminAPIAddr string
 	// AdminAPIToken 是 Admin API bearer token；开启 AdminAPIAddr 时必须显式配置。
 	AdminAPIToken string
+	// MarketAPIURL/MarketOperatorKey 指向 LunaX-маркет (market.daskgram.xyz) 的
+	// операторский API. Админка через них публикует юзернейм или номер как лот,
+	// не выходя из панели. Пустой URL выключает действие — панель остаётся
+	// работоспособной и без маркета.
+	MarketAPIURL      string
+	MarketOperatorKey string
+	// ChatBotOpsUserIDs 是 @ChatBot 服务器诊断的允许名单。为空时该能力完全关闭
+	// （默认）。名单内的账号在私聊里问「проверь сервер / uptime / память」时，бот
+	// 执行**固定的只读检查**并回传结果——不接受任意命令，也不接受聊天里传来的
+	// 任何凭据。
+	ChatBotOpsUserIDs []int64
+	// OpsAddr 是 ops-агент API 的监听地址（反向 канал диагностики）。空字符串
+	// 关闭该 API；nginx проксирует на него /ops/.
+	OpsAddr string
+	// OpsAgentBinaryPath 是供用户下载的 daskgram-ops 二进制路径；为空则不提供
+	// 下载路由（enroll 仍然可用，只是二进制要自己拿）。
+	OpsAgentBinaryPath string
 	// PublicBaseURL 是所有客户端可见 telesrv 链接的公开根 URL。
 	// 生产默认 https://telesrv.net；本地可设为 http://127.0.0.1:2401。
 	PublicBaseURL string
@@ -608,6 +625,9 @@ type Config struct {
 	// PremiumGrantMonths 是新注册账号默认赠送的会员月数；0 关闭赠送。
 	// 存量账号的一次性赠送由迁移 0094 backfill，不受该配置影响。
 	PremiumGrantMonths int
+	// PremiumGrantDays 按天赠送会员，优先于 PremiumGrantMonths。用于短促销
+	// （「7 天免费」），0 表示不启用。
+	PremiumGrantDays int
 	// PremiumBotUsername is the public username advertised in app config and
 	// Premium deep links. The reserved bot id remains stable.
 	PremiumBotUsername string
@@ -956,6 +976,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("TELESRV_GRAMSRV_BOT_CHAT_IDS: %w", err)
 	}
+	chatBotOpsUserIDs, err := parsePositiveInt64List(envListOr("TELESRV_CHATBOT_OPS_USER_IDS", nil))
+	if err != nil {
+		return Config{}, fmt.Errorf("TELESRV_CHATBOT_OPS_USER_IDS: %w", err)
+	}
 	premiumBotUsername := strings.TrimPrefix(strings.TrimSpace(envOr("TELESRV_PREMIUM_BOT_USERNAME", "premiumbot")), "@")
 	if !domain.ValidBotUsername(premiumBotUsername) {
 		return Config{}, fmt.Errorf("TELESRV_PREMIUM_BOT_USERNAME must be a valid username")
@@ -1009,9 +1033,14 @@ func Load() (Config, error) {
 		DebugAddr:                             envAllowEmptyOr("TELESRV_DEBUG_ADDR", "127.0.0.1:6060"),
 		BotAPIAddr:                            envAllowEmptyOr("TELESRV_BOT_API_ADDR", ""),
 		GramsrvBotChatIDs:                     gramsrvBotChatIDs,
+		ChatBotOpsUserIDs:                     chatBotOpsUserIDs,
 		StarGiftCrossCraftUserIDs:             crossCraftUserIDs,
 		AdminAPIAddr:                          envAllowEmptyOr("TELESRV_ADMIN_API_ADDR", ""),
 		AdminAPIToken:                         envOr("TELESRV_ADMIN_API_TOKEN", ""),
+		MarketAPIURL:                          strings.TrimSpace(envAllowEmptyOr("TELESRV_MARKET_API_URL", "")),
+		MarketOperatorKey:                     strings.TrimSpace(envAllowEmptyOr("TELESRV_MARKET_OPERATOR_KEY", "")),
+		OpsAddr:                               strings.TrimSpace(envAllowEmptyOr("TELESRV_OPS_ADDR", "127.0.0.1:2405")),
+		OpsAgentBinaryPath:                    strings.TrimSpace(envAllowEmptyOr("TELESRV_OPS_AGENT_BINARY", "")),
 		PublicBaseURL:                         publicBaseURL,
 		Branding:                              brandConfig,
 		UpdatePublicURL:                       updatePublicURL,
@@ -1266,6 +1295,7 @@ func Load() (Config, error) {
 		CallExpiryInterval:     envDurationOr("TELESRV_CALL_EXPIRY_INTERVAL", time.Second),
 
 		PremiumGrantMonths:               envIntOr("TELESRV_PREMIUM_GRANT_MONTHS", 3),
+		PremiumGrantDays:                 envIntOr("TELESRV_PREMIUM_GRANT_DAYS", 0),
 		PremiumBotUsername:               premiumBotUsername,
 		PremiumBotUserID:                 premiumBotUserID,
 		PremiumPlans:                     premiumPlans,

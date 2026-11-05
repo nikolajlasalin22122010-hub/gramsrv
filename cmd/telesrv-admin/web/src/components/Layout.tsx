@@ -17,7 +17,7 @@ export function BootScreen() {
       <div className="brand compact brand-elevated">
         <span className="brand-mark"><img src={withBase("/logo.png")} alt="" /></span>
         <span>
-          <strong>telesrv</strong>
+          <strong>DaskGram</strong>
           <small>{t("app.adminConsole")}</small>
         </span>
       </div>
@@ -63,7 +63,7 @@ export function Shell({
     return () => window.removeEventListener("telesrv:identity-changed", load);
   }, [can]);
   const [brandIconFailed, setBrandIconFailed] = useState(false);
-  const brandName = identity?.name?.trim() || "telesrv";
+  const brandName = identity?.name?.trim() || "DaskGram";
   const brandIconSrc = identity?.iconExt && !brandIconFailed ? api.serverIconURL() : withBase("/logo.png");
 
   // The browser tab (title + favicon) follows the same custom-identity

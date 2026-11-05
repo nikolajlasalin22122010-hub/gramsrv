@@ -1,4 +1,4 @@
-import { Crown, Flame, Phone, RefreshCw, Save, Search, ShieldCheck, Undo2 } from "lucide-react";
+import { Crown, Flame, Phone, RefreshCw, Save, Search, ShieldCheck, Store, Undo2 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { api, errorMessage } from "../api";
 import { ActionButton } from "../components/ActionButton";
@@ -9,6 +9,8 @@ import { useI18n } from "../i18n";
 import { formatCurrency, formatCurrencyAmount, toSmallestUnits } from "../lib/format";
 import type { Navigate } from "../routing";
 import type { AccountRow, CollectiblePhoneRow, CollectiblePhoneTier } from "../types";
+import { MarketLotModal } from "./MarketLotModal";
+import { MarketLotsPanel } from "./MarketLotsPanel";
 
 type Status = "" | "vault" | "owned" | "burned";
 
@@ -32,6 +34,8 @@ export function CollectiblePhonesPage({ navigate }: { navigate: Navigate }) {
   const [recipient, setRecipient] = useState<AccountRow | null>(null);
   const [editAmount, setEditAmount] = useState("");
   const [editCryptoAmount, setEditCryptoAmount] = useState("");
+  // Market listing target: digits of the number the operator clicked on.
+  const [market, setMarket] = useState<string | null>(null);
 
   async function load() {
     setBusy(true); setError("");
@@ -104,8 +108,10 @@ export function CollectiblePhonesPage({ navigate }: { navigate: Navigate }) {
       <button className="btn primary" onClick={load}>{t("common.search")}</button>
     </div>
 
+    <MarketLotsPanel kind="number"/>
+
     <div className="table-wrap"><table className="data-table"><thead><tr><th>{t("phones.number")}</th><th>{t("phones.class")}</th><th>{t("common.status")}</th><th>{t("common.owner")}</th><th>{t("usernames.price")}</th><th>{t("usernames.transfers")}</th><th/></tr></thead><tbody>
-      {rows.map(row => <tr key={row.id} className={selected?.id===row.id?"selected-row":""}><td className="mono"><strong>{shownPhone(row.phone)}</strong></td><td><Badge tone={row.tier==="exclusive"?"warn":"neutral"}>{row.tier==="exclusive"?<Crown size={13}/>:<ShieldCheck size={13}/>} {t(`phones.${row.tier}`)}</Badge></td><td><Badge tone={row.status==="owned"?"good":row.status==="burned"?"danger":"neutral"}>{t(`usernames.status${row.status[0].toUpperCase()}${row.status.slice(1)}`)}</Badge></td><td className="mono">{row.owner_user_id!=="0"?row.owner_user_id:"—"}</td><td className="mono">{phonePriceLabel(row)}</td><td>{row.transfer_count}</td><td><button className="row-link" onClick={()=>manage(row)}>{t("phones.manage")}</button></td></tr>)}
+      {rows.map(row => <tr key={row.id} className={selected?.id===row.id?"selected-row":""}><td className="mono"><strong>{shownPhone(row.phone)}</strong></td><td><Badge tone={row.tier==="exclusive"?"warn":"neutral"}>{row.tier==="exclusive"?<Crown size={13}/>:<ShieldCheck size={13}/>} {t(`phones.${row.tier}`)}</Badge></td><td><Badge tone={row.status==="owned"?"good":row.status==="burned"?"danger":"neutral"}>{t(`usernames.status${row.status[0].toUpperCase()}${row.status.slice(1)}`)}</Badge></td><td className="mono">{row.owner_user_id!=="0"?row.owner_user_id:"—"}</td><td className="mono">{phonePriceLabel(row)}</td><td>{row.transfer_count}</td><td><button className="row-link" onClick={()=>manage(row)}>{t("phones.manage")}</button><button className="row-link" onClick={()=>setMarket(row.phone.replace(/\D/g,""))}><Store size={14}/> На маркет</button></td></tr>)}
       {!rows.length && <EmptyRow colSpan={7}/>}</tbody></table></div>
 
     {selected && selected.status!=="burned" && <section className="section-block phone-action-strip">
@@ -121,6 +127,7 @@ export function CollectiblePhonesPage({ navigate }: { navigate: Navigate }) {
         <ActionButton label={t("usernames.burn")} icon={<Flame size={14}/>} tone="danger" path="/api/actions/revoke-collectible-phone" payload={()=>({phone:selected.phone,burn:true})} onDone={load}/>
       </div></div>
     </section>}
+    {market && <MarketLotModal kind="number" name={market} onClose={()=>setMarket(null)} onDone={()=>undefined}/>}
   </PageFrame>;
 }
 

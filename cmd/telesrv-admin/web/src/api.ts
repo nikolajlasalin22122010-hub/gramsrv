@@ -37,6 +37,7 @@ import type {
   GroupMessageListResponse,
   MessageDetail,
   MessageListResponse,
+  MarketLotRow,
   ModerationCaseDetail,
   ModerationCaseRow,
   ModerationReport,
@@ -164,6 +165,14 @@ export function errorMessage(error: unknown): string {
 }
 
 export const api = {
+  paymentSettings: () =>
+    request<{ wallet: string; secret_set: boolean; platega_merchant: string; platega_secret_set: boolean }>("/api/payments/settings"),
+  setPaymentSettings: (body: { wallet: string; secret?: string; platega_merchant?: string; platega_secret?: string }) =>
+    request<{ ok: boolean }>("/api/actions/set-payment-settings", { method: "POST", body: JSON.stringify(body) }),
+  paymentInvoices: () =>
+    request<{ invoices: Array<{ id: number; bot_id: number; amount: number; currency: string; status: string; title: string; created_at: string; paid_at?: string | null }> }>(
+      "/api/payments/invoices"
+    ),
   session: () => request<AdminSession>("/api/session"),
   login: async (username: string, secret: string) => {
     const result = await request<AdminLoginResult>("/api/login", {
@@ -276,6 +285,29 @@ export const api = {
 	officialGiftAnimation: (id: string) => request<Record<string, unknown>>(`/api/official-gifts/${encodeURIComponent(id)}/animation`),
 	giftAnimation: (id: string) => request<Record<string, unknown>>(`/api/gifts/${encodeURIComponent(id)}/animation`),
 	giftCollectibles: (id: string) => request<StarGiftCollectiblePreview>(`/api/gifts/${encodeURIComponent(id)}/collectibles`),
+	// Publishes a collectible username, number or gift as a lot on the
+	// marketplace. The panel proxies this to the market's operator API, so the
+	// response is the lot id and slug the market assigned, not a CommandResult.
+	// `gift` is forwarded untouched -- the market owns that descriptor.
+	marketLot: (body: {
+		kind: "username" | "number" | "gift";
+		name?: string;
+		price: number;
+		auction_hours: number;
+		gift?: { slug: string; collection: string; num: number; gift_id: number };
+	}) =>
+		request<{ id: string; slug: string; status: string }>("/api/actions/market-lot", {
+			method: "POST",
+			body: JSON.stringify(body)
+		}),
+	// Active listings, so the panel can take one down again.
+	marketLots: (kind: "username" | "number" | "gift") =>
+		request<{ lots: MarketLotRow[] }>(`/api/market/lots?kind=${kind}`),
+	marketLotDelete: (id: number) =>
+		request<{ ok: boolean }>("/api/actions/market-lot-delete", {
+			method: "POST",
+			body: JSON.stringify({ id })
+		}),
 	giftCollectibleAnimation: (giftID: string, kind: "model" | "pattern", attributeID: string) => request<Record<string, unknown>>(`/api/gifts/${encodeURIComponent(giftID)}/collectibles/${kind}/${encodeURIComponent(attributeID)}/animation`),
 	importGift: (form: FormData) => request<CommandResult>("/api/actions/import-gift", { method: "POST", body: form }),
 	importGiftPack: (form: FormData) => request<CommandResult>("/api/actions/import-gift-pack", { method: "POST", body: form }),

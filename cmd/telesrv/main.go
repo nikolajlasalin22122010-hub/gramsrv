@@ -23,6 +23,8 @@ import (
 	"github.com/iamxvbaba/td/clock"
 	"github.com/iamxvbaba/td/exchange"
 	"github.com/iamxvbaba/td/tg"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	adminapp "telesrv/internal/admin"
 	"telesrv/internal/adminapi"
@@ -46,11 +48,13 @@ import (
 	groupcallsapp "telesrv/internal/app/groupcalls"
 	"telesrv/internal/app/help"
 	"telesrv/internal/app/langpack"
+	opsapp "telesrv/internal/app/ops"
 	"telesrv/internal/app/livestream"
 	"telesrv/internal/app/maintenance"
 	messageapp "telesrv/internal/app/messages"
 	moderationapp "telesrv/internal/app/moderation"
 	passkeyapp "telesrv/internal/app/passkey"
+	"telesrv/internal/app/payments"
 	phoneapp "telesrv/internal/app/phone"
 	pollsapp "telesrv/internal/app/polls"
 	premiumapp "telesrv/internal/app/premium"
@@ -1241,6 +1245,21 @@ func run(logger *zap.Logger) error {
 			account.WithLoginEmailVerification(codeStore, loginEmailSender, cfg.AuthCodeTTL, cfg.AuthCodeMaxAttempts, cfg.LoginEmailCodeLength))
 	}
 	accountService := account.NewService(passwordStore, accountOptions...)
+	// Reverse agent channel for @ChatBot diagnostics: agents on users' own VDS
+	// poll us outbound, so we never dial their hosts and never hold a password.
+	opsService := opsapp.NewService(pool)
+	opsServer := opsapp.NewServer(opsService)
+	opsServer.BinaryPath = cfg.OpsAgentBinaryPath
+	if cfg.OpsAddr != "" {
+		opsHTTP := &http.Server{Addr: cfg.OpsAddr, Handler: opsServer.Handler()}
+		go func() {
+			logger.Info("ops-агент API запущен", zap.String("addr", cfg.OpsAddr))
+			if err := opsHTTP.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Warn("ops-агент API остановлен", zap.Error(err))
+			}
+		}()
+		defer func() { _ = opsHTTP.Close() }()
+	}
 	botsService := botsapp.NewService(userStore, botStore, messageStore,
 		botsapp.WithLogger(logger.Named("bots")),
 		botsapp.WithBlockChecker(contactStore),
@@ -1248,6 +1267,9 @@ func run(logger *zap.Logger) error {
 		botsapp.WithUserCache(userCache),
 		botsapp.WithStickerSetCreator(filesService),
 		botsapp.WithGifCatalog(filesService),
+		botsapp.WithMessageMediaReader(filesService),
+		botsapp.WithChatBotOpsAllowlist(cfg.ChatBotOpsUserIDs),
+		botsapp.WithOpsService(opsService),
 		botsapp.WithUserStickerSets(accountService),
 		botsapp.WithTelegramLogin(telegramLoginService),
 		botsapp.WithGramsrvOperatorBot(cfg.GramsrvBotChatIDs, adminService),
@@ -1719,6 +1741,35 @@ func run(logger *zap.Logger) error {
 		auth.WithPasswords(passwordStore),
 		auth.WithBotLogin(botStore),
 		auth.WithPremiumGrant(cfg.PremiumGrantMonths),
+		auth.WithPremiumGrantDays(cfg.PremiumGrantDays),
+		// Signup premium must land in premium_entitlements, not just in
+		// users.premium_expires_at: @premiumbot and the purchase/refund paths
+		// read entitlements, so an aggregate-only grant showed up as "Premium is
+		// not active" in the bot while the client rendered the badge.
+		auth.WithPremiumEntitlementGrant(func(ctx context.Context, userID int64, until, months, days int) error {
+			grantMonths := months
+			grantDays := days
+			if grantDays > 0 {
+				grantDays = int(time.Unix(int64(until), 0).Sub(time.Now()).Hours() / 24)
+				if grantDays < 1 {
+					grantDays = 1
+				}
+				grantMonths = 1
+			}
+			if grantMonths < 1 {
+				grantMonths = 1
+			}
+			_, _, err := premiumStore.GrantPremiumEntitlement(ctx, domain.PremiumAdminGrantRequest{
+				UserID:       userID,
+				ActorUserID:  userID,
+				Months:       grantMonths,
+				DurationDays: grantDays,
+				Date:         int(time.Now().Unix()),
+				CommandKey:   "signup-premium:" + strconv.FormatInt(userID, 10),
+				Reason:       "signup promo",
+			})
+			return err
+		}),
 		auth.WithCodeTTL(cfg.AuthCodeTTL),
 		auth.WithCodeMaxAttempts(cfg.AuthCodeMaxAttempts),
 		auth.WithPhoneCodeDelivery(phoneCodeSender, cfg.PhoneCodeLength),
@@ -2235,7 +2286,41 @@ func run(logger *zap.Logger) error {
 			}(chain.Key, chainLog)
 		}
 	}
-	if _, err := botapi.Start(ctx, cfg.BotAPIAddr, botsService, usersService, router, router, router, logger.Named("botapi")); err != nil {
+	paymentsService := payments.NewService(postgres.NewPaymentStore(pool), payments.Config{
+		YooMoneyWallet:  os.Getenv("TELESRV_YOOMONEY_WALLET"),
+		YooMoneySecret:  os.Getenv("TELESRV_YOOMONEY_SECRET"),
+		PlategaMerchant: os.Getenv("TELESRV_PLATEGA_MERCHANT"),
+		PlategaSecret:   os.Getenv("TELESRV_PLATEGA_SECRET"),
+		PublicBaseURL:   cfg.PublicBaseURL,
+	}, logger.Named("payments")).WithSettings(pgPaymentSettings{pool: pool})
+
+	// Paid invoices with a "stars:<user>:<amount>" payload top up the Stars balance,
+	// which is what the built-in Premium bot spends.
+	paymentsService.WithPaidHook(func(ctx context.Context, invoice domain.PaymentInvoice) {
+		payload := strings.TrimSpace(invoice.Payload)
+		if !strings.HasPrefix(payload, "stars:") {
+			return
+		}
+		parts := strings.Split(payload, ":")
+		if len(parts) != 3 {
+			return
+		}
+		userID, userErr := strconv.ParseInt(parts[1], 10, 64)
+		amount, amountErr := strconv.ParseInt(parts[2], 10, 64)
+		if userErr != nil || amountErr != nil || userID <= 0 || amount <= 0 {
+			return
+		}
+		if _, err := starsService.Credit(ctx, userID, amount, domain.StarsReasonTopup,
+			domain.Peer{Type: domain.PeerTypeUser, ID: userID}, "Stars top-up", "YooMoney"); err != nil {
+			logger.Warn("stars top-up failed", zap.Int64("user_id", userID), zap.Error(err))
+			return
+		}
+		logger.Info("stars topped up", zap.Int64("user_id", userID), zap.Int64("amount", amount), zap.Int64("invoice_id", invoice.ID))
+	})
+	botsService.SetStarsTopUp(starsService)
+	botsService.SetPaymentInvoices(paymentsService)
+
+	if _, err := botapi.Start(ctx, cfg.BotAPIAddr, botsService, usersService, router, router, paymentsService, router, logger.Named("botapi")); err != nil {
 		return fmt.Errorf("start bot api: %w", err)
 	}
 	// Scoped tokens carry a bounded permission set; the master token stays
@@ -2272,6 +2357,7 @@ func run(logger *zap.Logger) error {
 		GiftWithdrawals:    giftsService,
 		RevenueWithdrawals: giftsService,
 		CustomFragment:     customFragmentService,
+		Payments:           paymentsService,
 		GiftClaim:          giftClaimService,
 		GiftClaimTest:      giftClaimTestService,
 		MiniApps: web.NewConfiguredMiniAppsHandler(web.MiniAppsConfig{
@@ -2418,4 +2504,21 @@ type giftClaimInstanceConfig struct {
 	Withdrawer          giftclaim.Withdrawer
 	Password            giftclaim.AccountPassword
 	MenuButtonRequired  bool
+}
+
+// pgPaymentSettings reads payment credentials saved by the admin panel.
+type pgPaymentSettings struct {
+	pool *pgxpool.Pool
+}
+
+func (p pgPaymentSettings) GetSetting(ctx context.Context, key string) (string, error) {
+	var value string
+	err := p.pool.QueryRow(ctx, `SELECT value FROM app_settings WHERE key=$1`, key).Scan(&value)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	return value, nil
 }

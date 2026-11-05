@@ -135,14 +135,14 @@ type GatewayWebhookControl interface {
 	ConfirmBotAPIWebhookDelivery(ctx context.Context, botID, updateID int64) error
 }
 
-func Start(ctx context.Context, addr string, bots BotsService, users UsersService, webapps WebAppService, invoices InvoiceService, gateway GatewayService, logger *zap.Logger) (*http.Server, error) {
+func Start(ctx context.Context, addr string, bots BotsService, users UsersService, webapps WebAppService, invoices InvoiceService, payments PaymentsService, gateway GatewayService, logger *zap.Logger) (*http.Server, error) {
 	if strings.TrimSpace(addr) == "" {
 		return nil, nil
 	}
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	handler := &handler{bots: bots, users: users, webapps: webapps, invoices: invoices, gateway: gateway, logger: logger, webhookClient: newWebhookHTTPClient()}
+	handler := &handler{bots: bots, users: users, webapps: webapps, invoices: invoices, payments: payments, gateway: gateway, logger: logger, webhookClient: newWebhookHTTPClient()}
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           handler.routes(),
@@ -174,6 +174,7 @@ func Start(ctx context.Context, addr string, bots BotsService, users UsersServic
 
 type handler struct {
 	invoices      InvoiceService
+	payments      PaymentsService
 	bots          BotsService
 	users         UsersService
 	webapps       WebAppService
@@ -329,6 +330,10 @@ func (h *handler) handle(w http.ResponseWriter, r *http.Request) {
 		h.sendGift(w, r, botID)
 	case "giftpremiumsubscription":
 		h.giftPremiumSubscription(w, r, botID)
+	case "createinvoicelink":
+		h.createInvoiceLink(w, r, botID)
+	case "getpaymentstatus":
+		h.getPaymentStatus(w, r, botID)
 	case "sendinvoice":
 		h.sendInvoice(w, r, botID)
 	case "refundstarpayment":

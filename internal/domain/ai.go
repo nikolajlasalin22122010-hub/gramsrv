@@ -37,6 +37,23 @@ func (t AIComposeText) Clone() AIComposeText {
 	return out
 }
 
+// AIAttachmentKind 标识随请求一起送进模型的多模态内容类型。目前只有图片是
+// OpenAI 兼容 chat/completions 里标准化的部分：音频（input_audio）和 PDF
+// （file）是各家自行的扩展，公开端点普遍不支持，所以不在这里定义。
+type AIAttachmentKind string
+
+const (
+	AIAttachmentImage AIAttachmentKind = "image"
+)
+
+// AIAttachment 是一份随请求发送的媒体内容。Data 是原始字节，Provider 负责
+// 按目标 API 的形态编码（OpenAI 兼容端点用 data: URL 的 base64）。
+type AIAttachment struct {
+	Kind AIAttachmentKind
+	MIME string
+	Data []byte
+}
+
 type AIComposeToneRefKind string
 
 const (
@@ -64,6 +81,9 @@ type AIComposeRequest struct {
 	Emojify         bool
 	TranslateToLang string
 	Tone            AIComposeToneRef
+	// Attachments carries media through to the provider. Only the text
+	// generation path fills it today.
+	Attachments []AIAttachment
 }
 
 type AIComposeResult struct {
@@ -75,6 +95,9 @@ type AITextGenerationRequest struct {
 	UserID      int64
 	Text        AIComposeText
 	Instruction string
+	// Attachments 是可选的随附媒体。为空时请求与纯文本完全一致，所以旧调用方
+	// 不需要任何改动。
+	Attachments []AIAttachment
 }
 
 type AIComposeTone struct {

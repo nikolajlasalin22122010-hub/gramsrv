@@ -16,6 +16,7 @@ import (
 
 	"go.uber.org/zap"
 
+	opsapp "telesrv/internal/app/ops"
 	telegramloginapp "telesrv/internal/app/telegramlogin"
 	"telesrv/internal/domain"
 	"telesrv/internal/links"
@@ -133,6 +134,12 @@ type Service struct {
 	stickers   stickerSetCreator
 	installer  userStickerSetInstaller
 	aiChat     aiChatGenerator
+	media      messageMediaReader
+	// chatBotOps 是服务器诊断的允许名单；为空时该能力关闭。
+	chatBotOps []int64
+	// ops — обратный агент-канал: у кого есть агент, диагностика идёт с его
+	// собственного сервера, а не с нашего.
+	ops *opsapp.Service
 	premium    premiumStorefront
 	gifCatalog interface {
 		ListGifCatalog(context.Context, bool) ([]domain.GifCatalogEntry, error)
@@ -153,6 +160,8 @@ type Service struct {
 	gramsrvOperators      map[int64]bool
 	gramsrvFreezes        gramsrvAccountFreezeManager
 	donations             donationsSource
+	starsTopUp            starsTopUpService
+	paymentInvoices       invoiceCreator
 	gramsrvAdmin          gramsrvFreezeAdmin
 	gramsrvAdminChatIDs   map[int64]struct{}
 	// dialogLimiter bounds how often one applicant can drive a service-bot dialog.
@@ -274,6 +283,32 @@ func WithGifCatalog(c interface {
 	GetDocuments(context.Context, []int64) ([]domain.Document, error)
 }) Option {
 	return func(s *Service) { s.gifCatalog = c }
+}
+
+// messageMediaReader is the narrow slice of the files service the chat bot needs
+// to pull an image the user just sent. Kept as an interface so the bots package
+// does not depend on the whole files app.
+type messageMediaReader interface {
+	GetFile(ctx context.Context, req domain.FileDownloadRequest) (domain.FileChunk, bool, error)
+}
+
+// WithMessageMediaReader lets @ChatBot forward images to the model. Without it
+// the bot stays text-only and answers non-text messages with a hint.
+func WithMessageMediaReader(r messageMediaReader) Option {
+	return func(s *Service) { s.media = r }
+}
+
+// WithChatBotOpsAllowlist enables the server-diagnostics answers for the listed
+// accounts. Only these users get real output; everyone else is refused, because
+// the bot is reachable from every account in the messenger.
+func WithChatBotOpsAllowlist(userIDs []int64) Option {
+	return func(s *Service) { s.chatBotOps = append([]int64(nil), userIDs...) }
+}
+
+// WithOpsService enables the reverse agent channel: users who enrolled their own
+// VDS get diagnostics from that host instead of ours.
+func WithOpsService(svc *opsapp.Service) Option {
+	return func(s *Service) { s.ops = svc }
 }
 
 // WithVerification injects the official verification service used by the
@@ -986,3 +1021,22 @@ func randomInt64() (int64, error) {
 		uint64(b[4])<<24 | uint64(b[5])<<16 | uint64(b[6])<<8 | uint64(b[7]))
 	return v, nil
 }
+
+// starsTopUpService credits Stars after an external payment.
+type starsTopUpService interface {
+	GetBalance(ctx context.Context, userID int64) (domain.StarsBalance, error)
+	Credit(ctx context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, title, desc string) (domain.StarsBalance, error)
+}
+
+// invoiceCreator creates payment invoices for the built-in shop.
+type invoiceCreator interface {
+	CreateYooMoneyInvoice(ctx context.Context, botUserID, userID, amount int64, title, description, payload string) (domain.PaymentInvoice, error)
+	CreatePlategaInvoice(ctx context.Context, botUserID, userID, amount int64, title, description, payload string) (domain.PaymentInvoice, error)
+	ProviderConfigured(ctx context.Context, provider string) bool
+}
+
+// SetStarsTopUp injects the Stars balance service used by the Premium bot.
+func (s *Service) SetStarsTopUp(c starsTopUpService) { s.starsTopUp = c }
+
+// SetPaymentInvoices injects the invoice creator used by the Premium bot.
+func (s *Service) SetPaymentInvoices(c invoiceCreator) { s.paymentInvoices = c }

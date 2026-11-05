@@ -19,6 +19,7 @@ import { CollectiblePhonesPage } from "./CollectiblePhonesPage";
 import { CollectibleUsernameDetailPage } from "./CollectibleUsernameDetailPage";
 import { CollectibleUsernamesPage } from "./CollectibleUsernamesPage";
 import { Dashboard } from "./Dashboard";
+import { PaymentsPage } from "./PaymentsPage";
 import { DonationsPage } from "./DonationsPage";
 import { EmojiPage } from "./EmojiPage";
 import { GifCatalogPage } from "./GifCatalogPage";
@@ -58,6 +59,9 @@ export function Routes({ route, navigate }: { route: RouteState; navigate: Navig
 }
 
 function RouteView({ route, navigate }: { route: RouteState; navigate: Navigate }) {
+  if (route.path === "/payments") {
+    return <PaymentsPage />;
+  }
   const accountID = route.path.match(/^\/accounts\/(\d+)$/)?.[1];
   const channelID = route.path.match(/^\/channels\/(\d+)$/)?.[1];
   const botID = route.path.match(/^\/bots\/(\d+)$/)?.[1];

@@ -37,6 +37,7 @@ type Config struct {
 	GiftWithdrawals    StarGiftWithdrawalResolver
 	RevenueWithdrawals ChannelRevenueWithdrawalResolver
 	CustomFragment     CustomFragmentHandler
+	Payments           PaymentsService
 	GiftClaim          http.Handler
 	GiftClaimTest      http.Handler
 	MiniApps           http.Handler
@@ -190,6 +191,7 @@ func newHandler(cfg Config, logger *zap.Logger) (http.Handler, error) {
 		giftWithdrawals:    cfg.GiftWithdrawals,
 		revenueWithdrawals: cfg.RevenueWithdrawals,
 		customFragment:     cfg.CustomFragment,
+		payments:           cfg.Payments,
 		appeals:            cfg.ModerationAppeals,
 		publicBaseURL:      cfg.PublicBaseURL,
 		appLinks:           appLinks,
@@ -200,6 +202,9 @@ func newHandler(cfg Config, logger *zap.Logger) (http.Handler, error) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", h.healthz)
+	mux.HandleFunc("POST /payments/yoomoney/callback", h.yooMoneyCallback)
+	mux.HandleFunc("POST /payments/platega/callback", h.plategaCallback)
+	mux.HandleFunc("GET /payments/platega/return", h.plategaReturn)
 	if cfg.AllowDevPayments {
 		mux.HandleFunc("GET /payments/dev-stars", h.devStarsCheckout)
 	}
@@ -337,6 +342,7 @@ type handler struct {
 	giftWithdrawals    StarGiftWithdrawalResolver
 	revenueWithdrawals ChannelRevenueWithdrawalResolver
 	customFragment     CustomFragmentHandler
+	payments           PaymentsService
 	appeals            ModerationAppealResolver
 	publicBaseURL      string
 	appLinks           links.AppLinkBuilder
@@ -807,6 +813,7 @@ func (h *handler) usernameLink(w http.ResponseWriter, r *http.Request) {
 		Description:  description,
 		CanonicalURL: h.publicUsernameURL(peer.username),
 		HomeURL:      h.publicBaseURL + "/",
+		LogoURL:      h.publicBaseURL + "/assets/logo-daskgram.png",
 		AppURL:       template.URL(app),
 		LegacyTgURL:  template.URL(legacy),
 		WebURL:       template.URL(publicWebAppURL(h.webBaseURL, legacy)),
@@ -1442,6 +1449,7 @@ type usernamePageData struct {
 	HomeURL      string
 	PhotoURL     string
 	Initials     string
+	LogoURL      string
 	ButtonLabel  string
 	AppURL       template.URL
 	LegacyTgURL  template.URL
@@ -1463,15 +1471,17 @@ func (h *handler) serveUsernameNotFound(w http.ResponseWriter, username string) 
 }
 
 var usernameLandingTemplate = template.Must(template.New("username-landing").Parse(`<!doctype html>
-<html lang="en">
+<html lang="ru">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#0e1621">
+  <meta name="theme-color" content="#050507">
   <title>{{.Title}} (@{{.Username}}) - {{.AppName}}</title>
   <meta name="description" content="{{.Description}}">
   <meta name="robots" content="index,follow,max-image-preview:large">
   <link rel="canonical" href="{{.CanonicalURL}}">
+  <link rel="icon" type="image/png" href="{{.LogoURL}}">
+  <link rel="apple-touch-icon" href="{{.LogoURL}}">
   <meta property="og:type" content="profile">
   <meta property="og:site_name" content="{{.AppName}}">
   <meta property="og:title" content="{{.Title}}">
@@ -1485,57 +1495,306 @@ var usernameLandingTemplate = template.Must(template.New("username-landing").Par
   <meta name="twitter:description" content="{{.Description}}">
   {{if .PhotoURL}}<meta name="twitter:image" content="{{.PhotoURL}}">{{end}}
   <style>
-    :root { color-scheme: dark; font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    * { box-sizing: border-box; }
-    body { margin: 0; min-height: 100svh; color: #f5f8fb; background:
-      radial-gradient(circle at 50% -20%, rgba(50, 161, 255, .25), transparent 42%), #0e1621; }
-    .shell { min-height: 100svh; display: grid; grid-template-rows: auto 1fr auto; }
-    .brand { display: flex; align-items: center; gap: 10px; width: fit-content; margin: 28px auto 0; color: #dceeff;
-      font-size: 17px; font-weight: 700; letter-spacing: .01em; text-decoration: none; }
-    .brand-mark { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 50%; color: white;
-      background: linear-gradient(145deg, #52b8ff, #168de2); box-shadow: 0 8px 24px rgba(31, 151, 232, .3); }
-    main { display: grid; place-items: center; padding: 32px 18px; }
-    .card { width: min(100%, 420px); padding: 34px 30px 28px; text-align: center; border: 1px solid rgba(255,255,255,.08);
-      border-radius: 24px; background: rgba(23, 33, 43, .92); box-shadow: 0 28px 90px rgba(0,0,0,.34); backdrop-filter: blur(18px); }
-    .avatar { display: grid; place-items: center; width: 112px; height: 112px; margin: 0 auto 22px; overflow: hidden;
-      border-radius: 50%; background: linear-gradient(145deg, #47b7ff, #167bc1); box-shadow: 0 16px 44px rgba(10, 112, 183, .3); }
-    .avatar img { display: block; width: 100%; height: 100%; object-fit: cover; }
-    .initials { font-size: 38px; font-weight: 750; letter-spacing: -.04em; color: white; }
-    h1 { display: flex; align-items: center; justify-content: center; gap: 8px; margin: 0; font-size: clamp(25px, 7vw, 32px);
-      line-height: 1.18; letter-spacing: -.025em; overflow-wrap: anywhere; }
-    .verified { display: inline-grid; flex: 0 0 auto; place-items: center; width: 21px; height: 21px; border-radius: 50%;
-      color: #fff; background: #3aa8f7; font-size: 13px; font-weight: 900; }
-    .username { margin: 8px 0 0; color: #67bff9; font-size: 16px; overflow-wrap: anywhere; }
-    .extra { margin: 7px 0 0; color: #91a3b5; font-size: 14px; }
-    .description { margin: 22px auto 0; color: #c5d0da; font-size: 15px; line-height: 1.55; white-space: pre-line;
-      overflow-wrap: anywhere; }
-    .actions { display: grid; gap: 11px; margin-top: 28px; }
-    .button { display: inline-flex; align-items: center; justify-content: center; min-height: 48px; padding: 0 20px; border-radius: 13px;
-      font-size: 15px; font-weight: 720; text-decoration: none; transition: transform .16s ease, background .16s ease; }
-    .button:hover { transform: translateY(-1px); }
-    .primary { color: #fff; background: linear-gradient(135deg, #31a9f5, #168de2); box-shadow: 0 10px 28px rgba(22,141,226,.25); }
-    .secondary { color: #a9dafa; background: rgba(72, 164, 226, .12); border: 1px solid rgba(89, 180, 241, .15); }
-    .legacy { margin: 18px 0 0; color: #718395; font-size: 12px; }
-    .legacy a { color: #83bddd; text-decoration: none; }
-    footer { padding: 0 18px 26px; color: #657789; font-size: 12px; text-align: center; }
-    @media (max-width: 480px) {
-      .brand { margin-top: 20px; }
-      main { padding: 24px 14px; align-items: start; }
-      .card { padding: 28px 22px 24px; border-radius: 20px; }
-      .avatar { width: 96px; height: 96px; }
+    :root {
+      color-scheme: dark;
+      --brand-a: #4f8cff;
+      --brand-b: #8a5cff;
+      --brand-c: #b16bff;
+      --text: #f4f6fa;
+      --muted: #98a3b3;
+      --line: rgba(255, 255, 255, .09);
+      font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
-    @media (prefers-reduced-motion: reduce) { .button { transition: none; } }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; }
+    body {
+      min-height: 100svh;
+      color: var(--text);
+      background: #050507;
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+    }
+    .glow {
+      position: fixed;
+      border-radius: 50%;
+      filter: blur(120px);
+      pointer-events: none;
+      z-index: 0;
+    }
+    .glow-a { width: 560px; height: 560px; top: -18%; left: -14%; background: rgba(79, 140, 255, .22); }
+    .glow-b { width: 520px; height: 520px; bottom: -22%; right: -16%; background: rgba(177, 107, 255, .20); }
+    .glow-c { width: 380px; height: 380px; top: 26%; left: 52%; transform: translateX(-50%); background: rgba(138, 92, 255, .12); }
+    .shell {
+      position: relative;
+      z-index: 1;
+      min-height: 100svh;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      grid-template-columns: minmax(0, 1fr);
+      max-width: 560px;
+      margin: 0 auto;
+      padding: 0 18px;
+    }
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 22px 4px 0;
+    }
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      color: #e9f1ff;
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: .01em;
+      text-decoration: none;
+    }
+    .brand-logo {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      object-fit: cover;
+      box-shadow: 0 8px 24px rgba(79, 140, 255, .28);
+    }
+    .share {
+      display: inline-grid;
+      place-items: center;
+      width: 40px;
+      height: 40px;
+      padding: 0;
+      border: 1px solid var(--line);
+      border-radius: 50%;
+      color: rgba(255, 255, 255, .62);
+      background: rgba(255, 255, 255, .04);
+      cursor: pointer;
+      transition: color .18s ease, background .18s ease, transform .18s ease;
+    }
+    .share:hover { color: #fff; background: rgba(255, 255, 255, .10); transform: translateY(-1px); }
+    .share svg { width: 18px; height: 18px; }
+    main {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 26px 0 10px;
+      min-width: 0;
+    }
+    .card {
+      width: 100%;
+      max-width: 520px;
+      min-width: 0;
+      padding: 36px 28px 26px;
+      text-align: center;
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      background:
+        linear-gradient(180deg, rgba(24, 26, 34, .86), rgba(11, 12, 16, .92));
+      box-shadow: 0 30px 90px rgba(0, 0, 0, .45), inset 0 1px 0 rgba(255, 255, 255, .05);
+      backdrop-filter: blur(18px);
+      -webkit-backdrop-filter: blur(18px);
+    }
+    .avatar-wrap {
+      position: relative;
+      width: 132px;
+      height: 132px;
+      margin: 0 auto 22px;
+      animation: float 6s ease-in-out infinite;
+    }
+    .ring {
+      position: absolute;
+      inset: 0;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--brand-a), var(--brand-b) 55%, var(--brand-c));
+      box-shadow: 0 20px 44px -12px rgba(138, 92, 255, .65);
+    }
+    .ring::after {
+      content: "";
+      position: absolute;
+      inset: 3px;
+      border-radius: 50%;
+      background: #0a0a0f;
+    }
+    .avatar {
+      position: absolute;
+      inset: 6px;
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+      border-radius: 50%;
+      background: linear-gradient(150deg, #1b2130, #0d1017);
+      z-index: 1;
+    }
+    .avatar img { display: block; width: 100%; height: 100%; object-fit: cover; }
+    .initials {
+      font-size: 44px;
+      font-weight: 750;
+      letter-spacing: -.04em;
+      background: linear-gradient(135deg, #9dc2ff, #b18cff);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+    .badge {
+      position: absolute;
+      right: -2px;
+      bottom: -2px;
+      z-index: 2;
+      display: grid;
+      place-items: center;
+      width: 36px;
+      height: 36px;
+      border: 3px solid #08090d;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--brand-a), var(--brand-b));
+      box-shadow: 0 8px 20px rgba(79, 140, 255, .45);
+    }
+    .badge svg { width: 17px; height: 17px; }
+    h1 {
+      margin: 0;
+      font-size: clamp(25px, 6.6vw, 32px);
+      line-height: 1.18;
+      letter-spacing: -.025em;
+      overflow-wrap: anywhere;
+    }
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 11px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      color: var(--muted);
+      background: rgba(255, 255, 255, .04);
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: .01em;
+      overflow-wrap: anywhere;
+    }
+    .chip.accent {
+      color: #b9a6ff;
+      border-color: rgba(138, 92, 255, .28);
+      background: rgba(138, 92, 255, .12);
+    }
+    .description {
+      margin: 22px auto 0;
+      max-width: 34ch;
+      color: #c3cbd8;
+      font-size: 15px;
+      line-height: 1.6;
+      white-space: pre-line;
+      overflow-wrap: anywhere;
+    }
+    .actions { display: grid; gap: 10px; margin-top: 28px; }
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 50px;
+      padding: 0 20px;
+      border-radius: 14px;
+      font-size: 15px;
+      font-weight: 700;
+      text-decoration: none;
+      transition: transform .16s ease, box-shadow .16s ease, background .16s ease;
+    }
+    .button:hover { transform: translateY(-1px); }
+    .primary {
+      color: #fff;
+      background: linear-gradient(135deg, var(--brand-a), var(--brand-b));
+      box-shadow: 0 14px 34px -10px rgba(138, 92, 255, .7);
+    }
+    .secondary {
+      color: #cfd8e6;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, .05);
+    }
+    .secondary:hover { background: rgba(255, 255, 255, .09); }
+    .legacy { margin: 18px 0 0; color: #6c7787; font-size: 12px; }
+    .legacy a { color: #8fa3bb; text-decoration: none; }
+    .legacy a:hover { color: #b9c8dc; }
+    footer {
+      padding: 6px 4px 26px;
+      color: #5d6878;
+      font-size: 12px;
+      text-align: center;
+    }
+    .toast {
+      position: fixed;
+      left: 50%;
+      bottom: 26px;
+      z-index: 5;
+      transform: translate(-50%, 16px);
+      padding: 10px 18px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(20, 22, 28, .96);
+      color: #e6ecf5;
+      font-size: 13px;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity .22s ease, transform .22s ease;
+    }
+    .toast.show { opacity: 1; transform: translate(-50%, 0); }
+    @keyframes float {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(-8px); }
+    }
+    @media (max-width: 480px) {
+      .shell { padding: 0 14px; }
+      .topbar { padding-top: 16px; }
+      main { padding: 18px 0 6px; }
+      .card { padding: 30px 20px 22px; border-radius: 24px; }
+      .avatar-wrap { width: 112px; height: 112px; }
+      .initials { font-size: 38px; }
+      .badge { width: 32px; height: 32px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .avatar-wrap { animation: none; }
+      .button, .share { transition: none; }
+    }
   </style>
 </head>
 <body>
+  <div class="glow glow-a"></div>
+  <div class="glow glow-b"></div>
+  <div class="glow glow-c"></div>
   <div class="shell">
-    <a class="brand" href="{{.HomeURL}}" aria-label="{{.AppName}} home"><span class="brand-mark">{{.AppInitial}}</span><span>{{.AppName}}</span></a>
+    <header class="topbar">
+      <a class="brand" href="{{.HomeURL}}" aria-label="{{.AppName}} home">
+        <img class="brand-logo" src="{{.LogoURL}}" alt="{{.AppName}}" width="32" height="32">
+        <span>{{.AppName}}</span>
+      </a>
+      <button class="share" type="button" id="share" data-url="{{.CanonicalURL}}" aria-label="Share link">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="18" cy="5" r="3"></circle>
+          <circle cx="6" cy="12" r="3"></circle>
+          <circle cx="18" cy="19" r="3"></circle>
+          <path d="M8.6 13.5l6.8 4M15.4 6.5l-6.8 4"></path>
+        </svg>
+      </button>
+    </header>
     <main>
       <article class="card">
-        <div class="avatar">{{if .PhotoURL}}<img src="{{.PhotoURL}}" alt="{{.Title}} profile photo" width="112" height="112">{{else}}<span class="initials" aria-hidden="true">{{.Initials}}</span>{{end}}</div>
-        <h1><span>{{.Title}}</span>{{if .Verified}}<span class="verified" title="Verified" aria-label="Verified">✓</span>{{end}}</h1>
-        <p class="username">@{{.Username}}</p>
-        {{if .Extra}}<p class="extra">{{.Extra}}</p>{{end}}
+        <div class="avatar-wrap">
+          <div class="ring"></div>
+          <div class="avatar">{{if .PhotoURL}}<img src="{{.PhotoURL}}" alt="{{.Title}}" width="132" height="132">{{else}}<span class="initials" aria-hidden="true">{{.Initials}}</span>{{end}}</div>
+          {{if .Verified}}<span class="badge" title="Verified" aria-label="Verified"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"></path></svg></span>{{end}}
+        </div>
+        <h1>{{.Title}}</h1>
+        <div class="chips">
+          <span class="chip accent">@{{.Username}}</span>
+          {{if .Extra}}<span class="chip">{{.Extra}}</span>{{end}}
+        </div>
         <p class="description">{{.Description}}</p>
         <div class="actions">
           <a class="button primary" href="{{.AppURL}}">{{.ButtonLabel}}</a>
@@ -1546,7 +1805,39 @@ var usernameLandingTemplate = template.Must(template.New("username-landing").Par
     </main>
     <footer>If you have {{.AppName}}, this page can open the chat directly.</footer>
   </div>
-  <script>window.setTimeout(function () { window.location.href = {{.AppURLJS}}; }, 250);</script>
+  <div class="toast" id="toast">Link copied</div>
+  <script>
+    (function () {
+      var button = document.getElementById("share");
+      var toast = document.getElementById("toast");
+      function flash() {
+        toast.classList.add("show");
+        window.setTimeout(function () { toast.classList.remove("show"); }, 1600);
+      }
+      function copy(value) {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(value).then(flash, fallback);
+          return;
+        }
+        fallback();
+        function fallback() {
+          var area = document.createElement("textarea");
+          area.value = value;
+          area.setAttribute("readonly", "");
+          area.style.position = "fixed";
+          area.style.opacity = "0";
+          document.body.appendChild(area);
+          area.select();
+          try { document.execCommand("copy"); flash(); } catch (err) { window.prompt("Copy link", value); }
+          document.body.removeChild(area);
+        }
+      }
+      if (button) {
+        button.addEventListener("click", function () { copy(button.getAttribute("data-url") || window.location.href); });
+      }
+      window.setTimeout(function () { window.location.href = {{.AppURLJS}}; }, 250);
+    })();
+  </script>
 </body>
 </html>
 `))

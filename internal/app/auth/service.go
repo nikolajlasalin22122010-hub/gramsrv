@@ -103,6 +103,14 @@ type Service struct {
 	loginEmailCodeLength   int
 	// premiumGrantMonths 是新注册账号默认赠送的会员月数；0 表示关闭赠送。
 	premiumGrantMonths int
+	// premiumGrantDays 与 premiumGrantMonths 二选一，按天赠送时优先使用。天粒度
+	// 是给「7 天 пробный период」这类短促销用的，月粒度仍然是默认语义。
+	premiumGrantDays int
+	// premiumEntitlementGrant 可选：配置后新账号的赠送不再只写
+	// users.premium_expires_at，而是交给它一次性写入 premium_entitlements 并同步
+	// 聚合字段。没有它时（例如单测里的内存实现）退回只写聚合字段的老行为——
+	// 那种账号在 @premiumbot 里会被当成「没有会员」，因为 bot 读的是 entitlements。
+	premiumEntitlementGrant func(ctx context.Context, userID int64, until int, months, days int) error
 	// welcomeMessageIdentity 是 identity.Store 的共享实例，recordWelcomeMessage
 	// 每次调用都重新读取（不缓存），使管理面板对登录通知模板的修改无需重启即可
 	// 生效——与 identity 包自身的设计契约一致。nil 时该来源被跳过，直接落到
@@ -224,6 +232,27 @@ func WithBotLogin(bots store.BotStore) Option {
 func WithPremiumGrant(months int) Option {
 	return func(s *Service) {
 		s.premiumGrantMonths = months
+	}
+}
+
+// WithPremiumGrantDays 按天赠送会员（0 = 关闭）。与 WithPremiumGrant 同时配置时
+// 天粒度优先，方便做「7 天试用到 xx 号」这类短促销。
+func WithPremiumGrantDays(days int) Option {
+	return func(s *Service) {
+		if days > 0 {
+			s.premiumGrantDays = days
+		}
+	}
+}
+
+// WithPremiumEntitlementGrant 把新账号的赠送交给外部写入 premium_entitlements。
+// 不配置时只写 users.premium_expires_at，账号在 @premiumbot 里会被判成「没有
+// 会员」——所以生产环境必须配置它。
+func WithPremiumEntitlementGrant(
+	grant func(ctx context.Context, userID int64, until int, months, days int) error,
+) Option {
+	return func(s *Service) {
+		s.premiumEntitlementGrant = grant
 	}
 }
 
@@ -1246,14 +1275,30 @@ func (s *Service) SignUp(ctx context.Context, auth domain.Authorization, phone, 
 		FirstName:  firstName,
 		LastName:   lastName,
 	}
-	// 新账号默认赠送会员：到期时间 = 注册时刻 + N 个月（与迁移 0094 对存量
-	// 账号的 backfill 同一语义）。premium 状态由下发路径按该时间即时派生。
-	if s.premiumGrantMonths > 0 {
-		newUser.PremiumUntil = int(time.Now().AddDate(0, s.premiumGrantMonths, 0).Unix())
+	// 新账号默认赠送会员：到期时间 = 注册时刻 + N 天（优先）或 N 个月（与迁移
+	// 0094 对存量账号的 backfill 同一语义）。premium 状态由下发路径按该时间即时
+	// 派生。配了 premiumEntitlementGrant 时不在这里写聚合字段，改由它在创建账号
+	// 之后一次性写 entitlement + 聚合，避免出现「有会员但没有 entitlement」的
+	// 账号——那种账号在 @premiumbot 里显示未开通。
+	grantUntil := 0
+	if s.premiumGrantDays > 0 {
+		grantUntil = int(time.Now().AddDate(0, 0, s.premiumGrantDays).Unix())
+	} else if s.premiumGrantMonths > 0 {
+		grantUntil = int(time.Now().AddDate(0, s.premiumGrantMonths, 0).Unix())
+	}
+	if grantUntil > 0 && s.premiumEntitlementGrant == nil {
+		newUser.PremiumUntil = grantUntil
 	}
 	u, err := s.users.Create(ctx, newUser)
 	if err != nil {
 		return domain.User{}, domain.Message{}, err
+	}
+	if grantUntil > 0 && s.premiumEntitlementGrant != nil {
+		// 赠送失败不应该把注册搞挂：账号已经建好了，会员可以补发。
+		_ = s.premiumEntitlementGrant(ctx, u.ID, grantUntil, s.premiumGrantMonths, s.premiumGrantDays)
+		if refreshed, found, err := s.users.ByID(ctx, u.ID); err == nil && found {
+			u = refreshed
+		}
 	}
 	if rec.VerifiedEmail && strings.TrimSpace(rec.PendingEmail) != "" && s.loginEmails != nil {
 		if err := s.loginEmails.SetLoginEmail(ctx, u.ID, rec.PendingEmail); err != nil {

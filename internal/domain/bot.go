@@ -48,6 +48,9 @@ var (
 	ErrBotNameInvalid     = errors.New("bot name invalid")
 	ErrBotUsernameInvalid = errors.New("bot username invalid")
 	ErrBotNotFound        = errors.New("bot not found")
+	ErrPaymentInvalid     = errors.New("payment is invalid")
+	ErrPaymentProviderNotConfigured = errors.New("payment provider is not configured")
+	ErrPaymentInsufficientFunds     = errors.New("insufficient stars balance")
 	// ErrBotCommandInvalid 表示命令名/描述非法（bots.setBotCommands）。
 	ErrBotCommandInvalid = errors.New("bot command invalid")
 	// ErrBotInfoInvalid 表示 setBotInfo 的 name/about/description 越界。

@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"path"
 	"strconv"
 	"strings"
@@ -88,6 +89,9 @@ func (s *server) routes() http.Handler {
 	mux.Handle("GET /api/audit-logs", s.scopedRoute(permissionAuditRead, http.HandlerFunc(s.handleAuditLogsAPI)))
 
 	mux.Handle("GET /api/dashboard", s.scopedRoute(permissionDashboardRead, http.HandlerFunc(s.handleDashboardAPI)))
+	mux.Handle("GET /api/payments/settings", s.scopedRoute(permissionServerManage, http.HandlerFunc(s.handlePaymentSettingsAPI)))
+	mux.Handle("POST /api/actions/set-payment-settings", s.scopedRoute(permissionServerManage, http.HandlerFunc(s.handleSetPaymentSettingsAPI)))
+	mux.Handle("GET /api/payments/invoices", s.scopedRoute(permissionServerManage, http.HandlerFunc(s.handlePaymentInvoicesAPI)))
 	mux.Handle("GET /api/stats", s.scopedRoute(permissionDashboardRead, http.HandlerFunc(s.handleStatsAPI)))
 	mux.Handle("GET /api/accounts", s.scopedRoute(permissionAccountsRead, http.HandlerFunc(s.handleAccountsAPI)))
 	mux.Handle("GET /api/accounts/shared-devices", s.scopedRoute(permissionAccountsRead, http.HandlerFunc(s.handleSharedDeviceGroupsAPI)))
@@ -149,6 +153,9 @@ func (s *server) routes() http.Handler {
 	mux.Handle("GET /api/item-prices", s.scopedRoute(permissionPricesManage, http.HandlerFunc(s.handleItemPricesAPI)))
 	mux.Handle("POST /api/actions/item-price-update", s.scopedRoute(permissionPricesManage, http.HandlerFunc(s.handleUpdateItemPriceAPI)))
 	mux.Handle("POST /api/actions/item-price-set-rate", s.scopedRoute(permissionPricesManage, http.HandlerFunc(s.handleSetStarsRateAPI)))
+	mux.Handle("POST /api/actions/market-lot", s.scopedRoute(permissionPricesManage, http.HandlerFunc(s.handleMarketLotAPI)))
+	mux.Handle("GET /api/market/lots", s.scopedRoute(permissionPricesManage, http.HandlerFunc(s.handleMarketLotsAPI)))
+	mux.Handle("POST /api/actions/market-lot-delete", s.scopedRoute(permissionPricesManage, http.HandlerFunc(s.handleMarketLotDeleteAPI)))
 	mux.Handle("POST /api/actions/set-verified", s.scopedRoute(permissionVerificationReview, http.HandlerFunc(s.handleSetVerifiedAPI)))
 	mux.Handle("POST /api/actions/set-account-flags", s.scopedRoute(permissionAccountsManage, http.HandlerFunc(s.handleSetUserFlagsAPI)))
 	mux.Handle("POST /api/actions/set-channel-flags", s.scopedRoute(permissionChannelsManage, http.HandlerFunc(s.handleSetChannelFlagsAPI)))
@@ -1681,6 +1688,169 @@ type grantStarsAPIRequest struct {
 	Confirm   bool   `json:"confirm"`
 	UserID    int64  `json:"user_id"`
 	Amount    int64  `json:"amount"`
+}
+
+type marketLotAPIRequest struct {
+	Kind         string  `json:"kind"`
+	Name         string  `json:"name"`
+	Price        float64 `json:"price"`
+	AuctionHours int     `json:"auction_hours"`
+	// Gift is the market's own gift descriptor (slug/collection/num/gift_id).
+	// It is forwarded verbatim: the panel has no business knowing its shape
+	// beyond collecting it from the NFT gift row.
+	Gift json.RawMessage `json:"gift,omitempty"`
+}
+
+// handleMarketLotAPI publishes a collectible username or number as a lot on the
+// marketplace. The market keeps its own storage, so this is a plain proxy to its
+// operator API rather than an admin command: nothing on the telesrv side changes,
+// and a failed publish leaves the collectible exactly as it was.
+func (s *server) handleMarketLotAPI(w http.ResponseWriter, r *http.Request) {
+	var body marketLotAPIRequest
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	if s.cfg.MarketAPIURL == "" || s.cfg.MarketOperatorKey == "" {
+		writeAPIError(w, http.StatusConflict,
+			"market is not configured: set TELESRV_MARKET_API_URL and TELESRV_MARKET_OPERATOR_KEY")
+		return
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		strings.TrimRight(s.cfg.MarketAPIURL, "/")+"/api/operator/lots", bytes.NewReader(payload))
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+s.cfg.MarketOperatorKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		writeAPIError(w, http.StatusBadGateway, "market is unreachable: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// The market answers {"error":"invalid","message":"..."} on rejections;
+		// surfacing its own text is what tells the operator the price was too low
+		// or the username malformed.
+		message := strings.TrimSpace(string(raw))
+		var rejection struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(raw, &rejection) == nil && rejection.Message != "" {
+			message = rejection.Message
+		}
+		writeAPIError(w, http.StatusBadGateway, "market rejected the lot: "+message)
+		return
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		out = map[string]any{}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleMarketLotsAPI lists what is currently on the marketplace. Gifts live on
+// their own endpoint, so the kind decides where to look.
+func (s *server) handleMarketLotsAPI(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.MarketAPIURL == "" {
+		writeAPIError(w, http.StatusConflict, "market is not configured")
+		return
+	}
+	kind := strings.TrimSpace(r.URL.Query().Get("kind"))
+	path := "/api/lots"
+	switch kind {
+	case "gift":
+		path = "/api/gifts"
+	case "":
+	case "username", "number":
+		path += "?kind=" + url.QueryEscape(kind)
+	default:
+		writeAPIError(w, http.StatusBadRequest, "kind must be username, number or gift")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(s.cfg.MarketAPIURL, "/")+path, nil)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if s.cfg.MarketOperatorKey != "" {
+		req.Header.Set("Authorization", "Bearer "+s.cfg.MarketOperatorKey)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		writeAPIError(w, http.StatusBadGateway, "market is unreachable: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		writeAPIError(w, http.StatusBadGateway, "market rejected the list: "+strings.TrimSpace(string(raw)))
+		return
+	}
+	var lots []map[string]any
+	if err := json.Unmarshal(raw, &lots); err != nil {
+		writeAPIError(w, http.StatusBadGateway, "market returned an unexpected body")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"lots": lots})
+}
+
+// handleMarketLotDeleteAPI takes a lot off the marketplace. Bids, if any, stay in
+// the market's own records -- this only removes the listing.
+func (s *server) handleMarketLotDeleteAPI(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ID int64 `json:"id"`
+	}
+	if !decodeAction(w, r, &body) {
+		return
+	}
+	if s.cfg.MarketAPIURL == "" || s.cfg.MarketOperatorKey == "" {
+		writeAPIError(w, http.StatusConflict, "market is not configured")
+		return
+	}
+	if body.ID <= 0 {
+		writeAPIError(w, http.StatusBadRequest, "id is required")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete,
+		fmt.Sprintf("%s/api/operator/lots/%d", strings.TrimRight(s.cfg.MarketAPIURL, "/"), body.ID), nil)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+s.cfg.MarketOperatorKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		writeAPIError(w, http.StatusBadGateway, "market is unreachable: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		message := strings.TrimSpace(string(raw))
+		var rejection struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(raw, &rejection) == nil && rejection.Message != "" {
+			message = rejection.Message
+		}
+		writeAPIError(w, http.StatusBadGateway, "market rejected the removal: "+message)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *server) handleGrantStarsAPI(w http.ResponseWriter, r *http.Request) {

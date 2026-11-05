@@ -408,8 +408,9 @@ func (s *Service) GenerateText(ctx context.Context, req domain.AITextGenerationR
 		return domain.AIComposeText{}, err
 	}
 	composeReq := domain.AIComposeRequest{
-		UserID: req.UserID,
-		Text:   req.Text,
+		UserID:      req.UserID,
+		Text:        req.Text,
+		Attachments: req.Attachments,
 	}
 	fields := []zap.Field{
 		zap.Int64("user_id", req.UserID),
@@ -433,8 +434,9 @@ func (s *Service) GenerateTextStream(ctx context.Context, req domain.AITextGener
 		return domain.AIComposeText{}, err
 	}
 	composeReq := domain.AIComposeRequest{
-		UserID: req.UserID,
-		Text:   req.Text,
+		UserID:      req.UserID,
+		Text:        req.Text,
+		Attachments: req.Attachments,
 	}
 	fields := []zap.Field{
 		zap.Int64("user_id", req.UserID),

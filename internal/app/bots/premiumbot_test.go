@@ -211,7 +211,7 @@ func TestPremiumBotMenuCallbacksExecuteInsideLocalServer(t *testing.T) {
 	})
 
 	home := svc.handlePremium(context.Background(), owner.ID, "/start")
-	if home.ReplyMarkup == nil || len(home.ReplyMarkup.Inline) != 3 {
+	if home.ReplyMarkup == nil || len(home.ReplyMarkup.Inline) != 4 {
 		t.Fatalf("home markup = %+v", home.ReplyMarkup)
 	}
 	for _, row := range home.ReplyMarkup.Inline {
@@ -286,4 +286,99 @@ func containsAll(text string, parts ...string) bool {
 		}
 	}
 	return true
+}
+
+type fakeStarsTopUp struct {
+	balance  int64
+	credited int64
+}
+
+func (f *fakeStarsTopUp) GetBalance(context.Context, int64) (domain.StarsBalance, error) {
+	return domain.StarsBalance{Balance: f.balance}, nil
+}
+
+func (f *fakeStarsTopUp) Credit(_ context.Context, _ int64, amount int64, _ domain.StarsTransactionReason, _ domain.Peer, _, _ string) (domain.StarsBalance, error) {
+	f.credited += amount
+	return domain.StarsBalance{Balance: f.balance + f.credited}, nil
+}
+
+type fakeInvoiceCreator struct {
+	lastPayload  string
+	lastAmount   int64
+	lastProvider string
+	plategaReady bool
+}
+
+func (f *fakeInvoiceCreator) invoice(amount int64, payload, provider string) (domain.PaymentInvoice, error) {
+	f.lastPayload = payload
+	f.lastAmount = amount
+	f.lastProvider = provider
+	return domain.PaymentInvoice{ID: 7, PaymentURL: "https://pay.example/" + provider, Amount: amount, Status: domain.PaymentStatusPending}, nil
+}
+
+func (f *fakeInvoiceCreator) CreateYooMoneyInvoice(_ context.Context, _, _ int64, amount int64, _, _, payload string) (domain.PaymentInvoice, error) {
+	return f.invoice(amount, payload, "yoomoney")
+}
+
+func (f *fakeInvoiceCreator) CreatePlategaInvoice(_ context.Context, _, _ int64, amount int64, _, _, payload string) (domain.PaymentInvoice, error) {
+	return f.invoice(amount, payload, "platega")
+}
+
+func (f *fakeInvoiceCreator) ProviderConfigured(_ context.Context, provider string) bool {
+	if provider == "platega" {
+		return f.plategaReady
+	}
+	return provider == "yoomoney"
+}
+
+func TestPremiumBotStarsTopUpCreatesInvoice(t *testing.T) {
+	svc, users, _, _ := newTestService(t)
+	owner := newOwner(t, users, "+15550777")
+	stars := &fakeStarsTopUp{balance: 42}
+	invoices := &fakeInvoiceCreator{}
+	svc.SetStarsTopUp(stars)
+	svc.SetPaymentInvoices(invoices)
+
+	menu := svc.premiumBotTopUp(context.Background(), owner.ID)
+	if menu.ReplyMarkup == nil || len(menu.ReplyMarkup.Inline) != len(premiumStarsPackages) {
+		t.Fatalf("top-up menu = %+v", menu.ReplyMarkup)
+	}
+	if !strings.Contains(menu.Text, "42 Stars") {
+		t.Fatalf("top-up menu text = %q", menu.Text)
+	}
+	for _, row := range menu.ReplyMarkup.Inline {
+		if !strings.HasPrefix(string(row[0].Data), premiumCallbackTopUpBuy) {
+			t.Fatalf("top-up button is not a local callback: %+v", row[0])
+		}
+	}
+
+	methods := svc.premiumBotTopUpInvoice(context.Background(), owner.ID, 250)
+	if methods.ReplyMarkup == nil || len(methods.ReplyMarkup.Inline) != 2 {
+		t.Fatalf("payment methods = %+v", methods.ReplyMarkup)
+	}
+	if string(methods.ReplyMarkup.Inline[0][0].Data) != premiumCallbackTopUpPay+"yoomoney:250" ||
+		string(methods.ReplyMarkup.Inline[1][0].Data) != premiumCallbackTopUpPay+"platega:250" {
+		t.Fatalf("payment method callbacks = %+v / %+v", methods.ReplyMarkup.Inline[0][0], methods.ReplyMarkup.Inline[1][0])
+	}
+
+	yoo := svc.premiumBotTopUpPay(context.Background(), owner.ID, "yoomoney", 250)
+	if invoices.lastProvider != "yoomoney" || invoices.lastAmount != 44900 {
+		t.Fatalf("yoomoney invoice provider=%q amount=%d", invoices.lastProvider, invoices.lastAmount)
+	}
+	if !strings.HasPrefix(invoices.lastPayload, "stars:") || !strings.HasSuffix(invoices.lastPayload, ":250") {
+		t.Fatalf("invoice payload = %q", invoices.lastPayload)
+	}
+	if yoo.ReplyMarkup == nil || len(yoo.ReplyMarkup.Inline) != 1 ||
+		yoo.ReplyMarkup.Inline[0][0].Type != domain.MarkupButtonURL ||
+		yoo.ReplyMarkup.Inline[0][0].URL != "https://pay.example/yoomoney" {
+		t.Fatalf("yoomoney reply = %+v", yoo.ReplyMarkup)
+	}
+
+	platega := svc.premiumBotTopUpPay(context.Background(), owner.ID, "platega", 250)
+	if invoices.lastProvider != "platega" {
+		t.Fatalf("platega invoice provider=%q", invoices.lastProvider)
+	}
+	if platega.ReplyMarkup == nil || platega.ReplyMarkup.Inline[0][0].URL != "https://pay.example/platega" {
+		t.Fatalf("platega reply = %+v", platega.ReplyMarkup)
+	}
 }

@@ -78,6 +78,10 @@ type uiConfig struct {
 	PostgresDSN   string
 	AdminAPIURL   string
 	AdminAPIToken string
+	// MarketAPIURL/MarketOperatorKey point at the LunaX marketplace operator API.
+	// Empty URL disables the "list on market" action in the panel.
+	MarketAPIURL      string
+	MarketOperatorKey string
 	Password      string
 	Token         string
 	SessionKey    []byte
@@ -168,6 +172,8 @@ func loadConfig() (uiConfig, error) {
 		PostgresDSN:                appCfg.PostgresDSN,
 		AdminAPIURL:                adminAPIURL(adminAPIAddr),
 		AdminAPIToken:              appCfg.AdminAPIToken,
+		MarketAPIURL:               appCfg.MarketAPIURL,
+		MarketOperatorKey:          appCfg.MarketOperatorKey,
 		Password:                   appCfg.AdminUIPassword,
 		Token:                      appCfg.AdminUIToken,
 		SessionKey:                 sum[:],

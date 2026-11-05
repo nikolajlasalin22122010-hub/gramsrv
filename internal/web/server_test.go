@@ -948,7 +948,7 @@ func TestHandlerServesUserChannelAndSupergroupLandingPages(t *testing.T) {
 					t.Fatalf("body missing %q:\n%s", want, rr.Body.String())
 				}
 			}
-			if tc.path == "/aLiCe/" && strings.Count(rr.Body.String(), `<p class="username">@Alice</p>`) != 1 {
+			if tc.path == "/aLiCe/" && strings.Count(rr.Body.String(), `<span class="chip accent">@Alice</span>`) != 1 {
 				t.Fatalf("ordinary user username rendered more than once:\n%s", rr.Body.String())
 			}
 			if strings.Contains(rr.Body.String(), "+15551234567") || strings.Contains(rr.Body.String(), "987654321") || strings.Contains(rr.Body.String(), "1700000000") {

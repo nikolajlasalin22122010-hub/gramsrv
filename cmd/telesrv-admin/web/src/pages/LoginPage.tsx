@@ -51,7 +51,7 @@ export function LoginPage({ onLogin }: { onLogin: (session: AdminSession) => voi
           <div className="brand brand-elevated">
             <span className="brand-mark"><img src={brandIcon} alt="" /></span>
             <span>
-              <strong>telesrv</strong>
+              <strong>DaskGram</strong>
               <small>{t("app.adminConsole")}</small>
             </span>
           </div>
