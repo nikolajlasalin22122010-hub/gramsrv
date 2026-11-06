@@ -1,9 +1,10 @@
 import { ImagePlus, Loader2, Upload, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
-import { api, errorMessage } from "../api";
+import { api, errorCode, errorMessage } from "../api";
 import { useI18n } from "../i18n";
 import { Alert } from "./ui";
+import { toast } from "./Toast";
 
 export function AvatarModal({ kind, id, onClose, onDone }: {
   kind: "user" | "channel";
@@ -14,7 +15,6 @@ export function AvatarModal({ kind, id, onClose, onDone }: {
   const { t } = useI18n();
   const [file, setFile] = useState<File | null>(null);
   const [previewURL, setPreviewURL] = useState("");
-  const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -29,8 +29,8 @@ export function AvatarModal({ kind, id, onClose, onDone }: {
   }, [file]);
 
   async function submit() {
-    if (!file || !reason.trim()) {
-      setError(!file ? t("avatar.chooseFirst") : t("action.reasonRequired"));
+    if (!file) {
+      setError(t("avatar.chooseFirst"));
       return;
     }
     setBusy(true);
@@ -38,17 +38,24 @@ export function AvatarModal({ kind, id, onClose, onDone }: {
     try {
       const form = new FormData();
       const idField = kind === "channel" ? "channel_id" : "user_id";
-      form.set("metadata", JSON.stringify({ command_id: "", reason: reason.trim(), confirm: true, [idField]: id }));
+      // The audit reason is generated rather than typed, like every other
+      // command in the panel now.
+      const reason = `admin panel: ${t("avatar.change")} ${idField} ${id}`;
+      form.set("metadata", JSON.stringify({ command_id: "", reason, confirm: true, [idField]: id }));
       form.set("file", file, file.name);
       const result = kind === "channel" ? await api.setChannelAvatar(form) : await api.setAccountAvatar(form);
       if (result.error) {
         setError(result.error);
+        toast.error(result.error, result.error);
         return;
       }
+      toast.success(result.message || t("avatar.upload"));
       onDone();
       onClose();
     } catch (err) {
-      setError(errorMessage(err));
+      const message = errorMessage(err);
+      setError(message);
+      toast.error(message, errorCode(err));
     } finally {
       setBusy(false);
     }
@@ -68,7 +75,6 @@ export function AvatarModal({ kind, id, onClose, onDone }: {
             <span className="gift-file-copy"><span className="gift-field-label">{t("avatar.new")}</span><strong>{file ? file.name : t("avatar.chooseImage")}</strong></span>
             <span className="gift-file-action">{file ? t("common.changeFile") : t("common.chooseFile")}</span>
           </label>
-          <label className="gift-reason-field"><span>{t("action.reason")}</span><input value={reason} placeholder={t("avatar.reasonPlaceholder")} onChange={(event) => setReason(event.target.value)} /></label>
           {error && <Alert>{error}</Alert>}
         </div>
         <div className="modal-actions">

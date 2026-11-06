@@ -166,6 +166,21 @@ export function errorMessage(error: unknown): string {
   return String(error);
 }
 
+// errorCode is what the failure toast puts next to its copy button: a stable,
+// short, pasteable token instead of a sentence. The backend's own error string
+// wins when it has one; otherwise the HTTP status is the only fact we have.
+export function errorCode(error: unknown): string {
+  if (error instanceof APIError) {
+    const body = error.result as { error?: unknown; Error?: unknown; code?: unknown } | null;
+    const raw = body?.error ?? body?.Error ?? body?.code;
+    if (typeof raw === "string" && raw.trim()) {
+      return raw.trim();
+    }
+    return `HTTP ${error.status}`;
+  }
+  return "";
+}
+
 export const api = {
   paymentSettings: () =>
     request<{ wallet: string; secret_set: boolean; platega_merchant: string; platega_secret_set: boolean }>("/api/payments/settings"),

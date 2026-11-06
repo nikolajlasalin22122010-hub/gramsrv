@@ -484,13 +484,10 @@ func (s *Service) SendCode(ctx context.Context, phone string) (string, error) {
 	if found {
 		issuedUserID = existing.ID
 	}
-	// A flash-call-only prefix must never fall through to SMS, to an email
-	// code or to the fixed development code: the code stays server-side
-	// until the caller proves ownership of the number.
-	if s.flashcallRequiredFor(phone) {
-		hash, _, err := s.EnsureFlashcallCode(ctx, phone)
-		return hash, err
-	}
+	// A flash-call prefix keeps the ordinary delivery path: the code goes out as
+	// a 777000 service message to the account's other devices, and the flash
+	// call is an alternative channel for a caller who has no such device. The
+	// hash is bound to the number in createPhoneCode.
 	if s.loginEmailEnabled && s.loginEmails != nil {
 		email, found, err := s.loginEmails.LoginEmailByPhone(ctx, phone)
 		if err != nil {
@@ -544,24 +541,25 @@ func (s *Service) invalidateLoginCodeDetached(ctx context.Context, hash, phone s
 }
 
 func (s *Service) createPhoneCode(ctx context.Context, phone string, existingUserID int64) (string, error) {
-	// Resend and every other path that issues a login code funnels here, so
-	// the flash-call gate belongs at the top rather than at each caller.
-	if s.flashcallRequiredFor(phone) {
-		hash, _, err := s.EnsureFlashcallCode(ctx, phone)
-		return hash, err
-	}
 	hash, err := randomHex(8)
 	if err != nil {
 		return "", err
 	}
+	// A number on the flash-call channel always gets a real random code: the
+	// same value is revealed by the call, so the fixed development code would
+	// leak the secret. Outside that channel the fixed code is kept, because the
+	// phone-change flow relies on the same configured value and a build without
+	// any delivery channel still needs a code a tester can type.
 	code := s.fixedCode
 	channel := codeChannelPhone
 	deliveryID := ""
-	if s.phoneCodeSender != nil {
+	if s.phoneCodeSender != nil || code == "" || s.flashcallAppliesTo(phone) {
 		code, err = randomDigits(s.phoneCodeLength)
 		if err != nil {
 			return "", err
 		}
+	}
+	if s.phoneCodeSender != nil {
 		deliveryID, err = otpdelivery.NewDeliveryID()
 		if err != nil {
 			return "", err
@@ -584,6 +582,9 @@ func (s *Service) createPhoneCode(ctx context.Context, phone string, existingUse
 	if err := s.ensureIssuedOwnerAfterSet(ctx, hash, rec); err != nil {
 		return "", err
 	}
+	// Publish phone -> hash for the flash-call channel. Best effort: the 777000
+	// message below is the primary delivery.
+	s.bindFlashcallCode(ctx, phone, hash)
 	// Existing accounts always retain the original durable App-code path. Commit
 	// it before attempting the external mirror so a provider cannot replace the
 	// message fact or leave an externally disclosed code without local state.
@@ -1125,18 +1126,6 @@ func (s *Service) verifyLoginCode(ctx context.Context, phone, phoneCodeHash, cod
 	}
 	if !store.LoginCodeChannelVerifiable(rec.Channel) {
 		return store.PhoneCode{}, domain.User{}, false, ErrCodeInvalid
-	}
-	// For a flash-call-only prefix the code is never delivered, so knowing it
-	// is not enough: the owner of the number must have completed the call.
-	// A missing registry fails closed instead of silently trusting the code.
-	if s.flashcallRequiredFor(phone) {
-		confirmed, err := s.flashcallConfirmed(ctx, phone, phoneCodeHash)
-		if err != nil {
-			return store.PhoneCode{}, domain.User{}, false, err
-		}
-		if !confirmed {
-			return store.PhoneCode{}, domain.User{}, false, ErrCodeInvalid
-		}
 	}
 
 	before, beforeFound, err := s.currentPhoneOwner(ctx, phone)

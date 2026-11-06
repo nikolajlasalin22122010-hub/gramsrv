@@ -216,7 +216,6 @@ func newHandler(cfg Config, logger *zap.Logger) (http.Handler, error) {
 	if cfg.FlashCall != nil {
 		mux.HandleFunc("POST /v1/flashcall/start", cfg.FlashCall.HandleStart)
 		mux.HandleFunc("GET /v1/flashcall/status", cfg.FlashCall.HandleStatus)
-		mux.HandleFunc("GET "+flashCallPagePath, cfg.FlashCall.HandlePage)
 	}
 	mux.HandleFunc("GET /addstickers/{shortName}", h.addStickers)
 	mux.HandleFunc("GET /addemoji/{shortName}", h.addEmoji)

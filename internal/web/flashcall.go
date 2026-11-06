@@ -39,6 +39,7 @@ var (
 	errFlashCallRateLimited       = errors.New("flashcall: too many attempts")
 	errFlashCallUnknownSession    = errors.New("flashcall: unknown verification session")
 	errFlashCallBusy              = errors.New("flashcall: too many pending sessions")
+	errFlashCallNoPendingCode     = errors.New("flashcall: no login code pending for this number")
 )
 
 // FlashCallSession is a pending call request: the owner of Phone must dial
@@ -65,15 +66,13 @@ type FlashCallProvider interface {
 	Status(ctx context.Context, id string) (FlashCallStatus, error)
 }
 
-// LoginCodeIssuer issues a login code without delivering it, so the Web layer
-// can reveal it only after a flash call proves phone ownership.
+// LoginCodeIssuer exposes the login code already pending for a phone.
+//
+// The flash call is a second delivery channel to the same secret: the code the
+// client asked for (and that the 777000 service message carries) is what the
+// caller gets here, so the phone_code_hash the client already holds stays valid.
 type LoginCodeIssuer interface {
-	// EnsureFlashcallCode returns the pending login-code hash for phone,
-	// creating the record on first use. The code itself is never returned
-	// here: it only becomes usable after ConfirmFlashcall rotates it.
-	EnsureFlashcallCode(ctx context.Context, phone string) (hash string, expiresAt time.Time, err error)
-	// ConfirmFlashcall rotates the pending code and marks the number proven.
-	ConfirmFlashcall(ctx context.Context, phone string) (code string, err error)
+	FlashcallCode(ctx context.Context, phone string) (code string, expiresAt time.Time, err error)
 }
 
 // HTTPFlashCallProvider talks to the flashcall.ru JSON API.
@@ -196,21 +195,16 @@ const (
 	flashCallStartsPerPhone = 3
 	flashCallStartsPerIP    = 20
 	flashCallMaxPending     = 5000
-	flashCallPagePath       = "/verify"
 )
 
 type flashCallPending struct {
 	id          string
 	phone       string
 	flashcallID string
-	code        string
 	number      string
 	createdAt   time.Time
 	expiresAt   time.Time
 	confirmed   bool
-	// confirming guards against two concurrent polls rotating the code twice
-	// and handing out a value that the second rotation already invalidated.
-	confirming bool
 }
 
 // FlashCallService binds a login code to a phone-ownership proof: the code is
@@ -276,22 +270,23 @@ type flashCallStatusResult struct {
 	Code   string `json:"code,omitempty"`
 }
 
-// Start issues a login code for phone and opens a call request. The code stays
-// server-side until Status reports a confirmed call.
+// Start opens a call request for phone. The code it will reveal already exists:
+// the client asked for it before the call, and without one there is nothing to
+// reveal and no reason to spend a call.
 func (s *FlashCallService) Start(ctx context.Context, rawPhone, ip string) (flashCallStartResult, error) {
 	phone := normalizeFlashCallPhone(rawPhone)
 	if phone == "" || !s.allowed(phone) {
 		return flashCallStartResult{}, errFlashCallUnsupportedNumber
+	}
+	_, expiresAt, err := s.issuer.FlashcallCode(ctx, phone)
+	if err != nil {
+		return flashCallStartResult{}, errFlashCallNoPendingCode
 	}
 	now := s.now()
 	if err := s.reserve(phone, ip, now); err != nil {
 		return flashCallStartResult{}, err
 	}
 	session, err := s.provider.GetPhone(ctx, phone)
-	if err != nil {
-		return flashCallStartResult{}, err
-	}
-	_, expiresAt, err := s.issuer.EnsureFlashcallCode(ctx, phone)
 	if err != nil {
 		return flashCallStartResult{}, err
 	}
@@ -340,9 +335,9 @@ func (s *FlashCallService) Status(ctx context.Context, id string) (flashCallStat
 		return flashCallStatusResult{}, errFlashCallUnknownSession
 	}
 	if record.confirmed {
-		code := record.code
+		phone := record.phone
 		s.mu.Unlock()
-		return flashCallStatusResult{Status: FlashCallConfirmed, Code: code}, nil
+		return s.confirmedResult(ctx, phone)
 	}
 	flashcallID := record.flashcallID
 	phone := record.phone
@@ -373,43 +368,33 @@ func (s *FlashCallService) Status(ctx context.Context, id string) (flashCallStat
 			return flashCallStatusResult{}, errFlashCallUnknownSession
 		}
 		if current.confirmed {
-			code := current.code
 			s.mu.Unlock()
-			return flashCallStatusResult{Status: FlashCallConfirmed, Code: code}, nil
+			return s.confirmedResult(ctx, phone)
 		}
-		if current.confirming {
-			s.mu.Unlock()
-			return flashCallStatusResult{Status: FlashCallPending}, nil
-		}
-		current.confirming = true
-		s.mu.Unlock()
-
-		// Rotate only now: the code that existed while the call was in flight
-		// was never shown to anyone and must not survive confirmation.
-		code, err := s.issuer.ConfirmFlashcall(ctx, phone)
-		if err != nil {
-			s.mu.Lock()
-			if cur := s.pending[id]; cur != nil {
-				cur.confirming = false
-			}
-			s.mu.Unlock()
-			return flashCallStatusResult{}, err
-		}
-		s.mu.Lock()
-		if cur := s.pending[id]; cur != nil {
-			cur.confirmed = true
-			cur.confirming = false
-			cur.code = code
-		}
+		current.confirmed = true
 		s.mu.Unlock()
 		s.logger.Info("flashcall verification confirmed", zap.String("verification_id", id))
-		return flashCallStatusResult{Status: FlashCallConfirmed, Code: code}, nil
+		return s.confirmedResult(ctx, phone)
 	case FlashCallExpired:
 		s.forget(id)
 		return flashCallStatusResult{Status: FlashCallExpired}, nil
 	default:
 		return flashCallStatusResult{Status: FlashCallPending}, nil
 	}
+}
+
+// confirmedResult reads the code that was already pending for phone.
+//
+// Nothing is rotated here: the very same value is in the 777000 message, so
+// rotating it would invalidate a code the user may already be looking at on
+// another device.
+func (s *FlashCallService) confirmedResult(ctx context.Context, phone string) (flashCallStatusResult, error) {
+	code, _, err := s.issuer.FlashcallCode(ctx, phone)
+	if err != nil {
+		s.logger.Warn("flashcall confirmed but the login code is gone", zap.Error(err))
+		return flashCallStatusResult{Status: FlashCallExpired}, nil
+	}
+	return flashCallStatusResult{Status: FlashCallConfirmed, Code: code}, nil
 }
 
 func (s *FlashCallService) allowed(phone string) bool {
@@ -513,19 +498,15 @@ func (s *FlashCallService) HandleStatus(w http.ResponseWriter, r *http.Request) 
 	flashCallWriteJSON(w, http.StatusOK, result)
 }
 
-// HandlePage serves the public verification page.
-func (s *FlashCallService) HandlePage(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Referrer-Policy", "no-referrer")
-	_, _ = io.WriteString(w, strings.ReplaceAll(flashCallPageHTML, "__APP_NAME__", s.appName))
-}
-
+// HandlePage used to serve the public verification page. The page is gone: the
+// code arrives as a 777000 message in the client, and the flash call is an API
+// channel the client drives itself.
 func (s *FlashCallService) writeError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, errFlashCallUnsupportedNumber):
 		flashCallWriteJSON(w, http.StatusBadRequest, map[string]string{"error": "Поддерживаются только российские номера (+7)"})
+	case errors.Is(err, errFlashCallNoPendingCode):
+		flashCallWriteJSON(w, http.StatusConflict, map[string]string{"error": "Сначала запросите код в приложении"})
 	case errors.Is(err, ErrFlashCallPhoneRejected):
 		flashCallWriteJSON(w, http.StatusBadRequest, map[string]string{"error": "Неверный формат номера телефона"})
 	case errors.Is(err, errFlashCallRateLimited):
@@ -599,247 +580,3 @@ func normalizeFlashCallPhone(raw string) string {
 	}
 	return "+" + value
 }
-
-const flashCallPageHTML = `<!doctype html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Подтверждение номера — __APP_NAME__</title>
-<style>
-:root{--bg:#0a0c11;--card:#131722;--line:#242c3d;--text:#eef1f7;--muted:#8b95a9;--accent:#4f7cff;--ok:#31c07b;--err:#ff5f5f}
-*{box-sizing:border-box}
-html,body{height:100%}
-body{margin:0;display:flex;align-items:center;justify-content:center;padding:24px;color:var(--text);
-background:radial-gradient(900px 500px at 50% -10%,#1b2336 0%,var(--bg) 62%);
-font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
--webkit-font-smoothing:antialiased}
-.card{width:100%;max-width:440px;background:var(--card);border:1px solid var(--line);border-radius:20px;
-padding:30px;box-shadow:0 24px 70px rgba(0,0,0,.5)}
-.brand{display:flex;align-items:center;gap:10px;margin-bottom:22px;font-weight:650;letter-spacing:.2px}
-.dot{width:10px;height:10px;border-radius:50%;background:var(--accent);box-shadow:0 0 14px var(--accent)}
-h1{font-size:21px;line-height:1.3;margin:0 0 6px;font-weight:650}
-p.sub{margin:0 0 20px;color:var(--muted);font-size:14px}
-label{display:block;font-size:13px;color:var(--muted);margin-bottom:8px}
-input{width:100%;padding:14px 16px;border-radius:12px;border:1px solid var(--line);background:#0d1119;
-color:var(--text);font-size:17px;outline:none;transition:border-color .15s,box-shadow .15s}
-input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,124,255,.18)}
-button{width:100%;margin-top:16px;padding:14px 16px;border-radius:12px;border:0;background:var(--accent);
-color:#fff;font-size:16px;font-weight:600;cursor:pointer;transition:filter .15s,opacity .15s}
-button:hover:not(:disabled){filter:brightness(1.08)}
-button:disabled{opacity:.55;cursor:default}
-button.ghost{background:transparent;border:1px solid var(--line);color:var(--text);font-weight:500}
-.number{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:18px 20px;
-border-radius:14px;background:#0d1119;border:1px solid var(--line);margin:6px 0 18px}
-.number strong{font-size:24px;letter-spacing:.6px;font-variant-numeric:tabular-nums}
-.copy{border:1px solid var(--line);background:transparent;color:var(--muted);border-radius:10px;
-padding:8px 12px;font-size:13px;width:auto;margin:0;cursor:pointer}
-.timer{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:14px;margin-bottom:18px}
-.timer b{color:var(--text);font-variant-numeric:tabular-nums}
-.steps{color:var(--muted);font-size:14px;margin:0 0 18px;padding-left:20px}
-.steps li{margin-bottom:6px}
-.code{text-align:center;padding:22px;border-radius:14px;background:rgba(49,192,123,.08);
-border:1px solid rgba(49,192,123,.35);margin:6px 0 18px}
-.code span{display:block;font-size:13px;color:var(--muted);margin-bottom:8px}
-.code strong{font-size:34px;letter-spacing:8px;font-variant-numeric:tabular-nums;color:var(--ok)}
-.error{margin-top:14px;padding:12px 14px;border-radius:12px;background:rgba(255,95,95,.1);
-border:1px solid rgba(255,95,95,.35);color:#ffb3b3;font-size:14px}
-.hint{color:var(--muted);font-size:13px;margin-top:16px;text-align:center}
-[hidden]{display:none !important}
-</style>
-</head>
-<body>
-<div class="card">
-  <div class="brand"><span class="dot"></span>__APP_NAME__</div>
-
-  <section id="step-phone">
-    <h1>Подтвердите номер телефона</h1>
-    <p class="sub">Мы не отправляем SMS. Вместо этого вы позвоните на короткий номер — звонок бесплатный и сбрасывается автоматически.</p>
-    <label for="phone">Номер телефона</label>
-    <input id="phone" type="tel" inputmode="tel" autocomplete="tel" placeholder="+7 916 123-45-67">
-    <button id="start-btn" onclick="startFlow()">Продолжить</button>
-  </section>
-
-  <section id="step-call" hidden>
-    <h1>Позвоните на номер</h1>
-    <p class="sub">Наберите этот номер со своего телефона. Сбрасывать не нужно — звонок оборвётся сам.</p>
-    <div class="number">
-      <strong id="call-number">—</strong>
-      <button class="copy" onclick="copyNumber(this)">Копировать</button>
-    </div>
-    <div class="timer">Осталось: <b id="countdown">60 с</b></div>
-    <ol class="steps">
-      <li>Нажмите «Позвонить» в приложении телефона</li>
-      <li>Дождитесь одного гудка и сбросьте</li>
-      <li>Код появится здесь автоматически</li>
-    </ol>
-    <button class="ghost" onclick="resetFlow()">Запросить другой номер</button>
-  </section>
-
-  <section id="step-code" hidden>
-    <h1>Номер подтверждён</h1>
-    <p class="sub">Введите этот код в приложении __APP_NAME__ на экране входа.</p>
-    <div class="code">
-      <span>Ваш код</span>
-      <strong id="code-value">—</strong>
-    </div>
-    <button class="ghost" onclick="copyCode(this)">Скопировать код</button>
-    <p class="hint">Код действует 5 минут и работает один раз.</p>
-  </section>
-
-  <div id="error" class="error" hidden></div>
-</div>
-<script>
-(function(){
-  var API = '/v1/flashcall';
-  var currentId = null;
-  var pollTimer = null;
-  var tickTimer = null;
-  var deadline = 0;
-
-  function el(id){ return document.getElementById(id); }
-
-  function showStep(id){
-    var steps = ['step-phone','step-call','step-code'];
-    for(var i=0;i<steps.length;i++){ el(steps[i]).hidden = steps[i] !== id; }
-  }
-
-  function setError(message){
-    var box = el('error');
-    if(!message){ box.hidden = true; box.textContent = ''; return; }
-    box.hidden = false;
-    box.textContent = message;
-  }
-
-  function stopTimers(){
-    if(pollTimer){ clearInterval(pollTimer); pollTimer = null; }
-    if(tickTimer){ clearInterval(tickTimer); tickTimer = null; }
-  }
-
-  function startTicking(){
-    if(tickTimer){ clearInterval(tickTimer); }
-    tickTimer = setInterval(function(){
-      var left = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
-      el('countdown').textContent = left + ' с';
-      if(left === 0){ clearInterval(tickTimer); tickTimer = null; }
-    }, 250);
-  }
-
-  function startPolling(){
-    if(pollTimer){ clearInterval(pollTimer); }
-    pollTimer = setInterval(check, 2000);
-  }
-
-  function check(){
-    if(!currentId){ return; }
-    fetch(API + '/status?id=' + encodeURIComponent(currentId), {cache:'no-store'})
-      .then(function(res){
-        return res.json().catch(function(){ return {}; }).then(function(data){
-          return {ok: res.ok, status: res.status, data: data};
-        });
-      })
-      .then(function(result){
-        if(!result.ok){
-          if(result.status === 404){ fail('Сессия истекла. Запросите номер заново.'); }
-          return;
-        }
-        if(result.data.status === 'CONFIRMED' && result.data.code){
-          stopTimers();
-          el('code-value').textContent = result.data.code;
-          setError('');
-          showStep('step-code');
-          return;
-        }
-        if(result.data.status === 'EXPIRED'){
-          fail('Звонок не поступил. Запросите новый номер.');
-        }
-      })
-      .catch(function(){ /* network hiccup: keep polling until the deadline */ });
-  }
-
-  function fail(message){
-    stopTimers();
-    currentId = null;
-    showStep('step-phone');
-    setError(message);
-  }
-
-  window.startFlow = function(){
-    setError('');
-    var phone = el('phone').value.trim();
-    if(!phone){ setError('Введите номер телефона'); return; }
-    var button = el('start-btn');
-    button.disabled = true;
-    button.textContent = 'Получаем номер…';
-    fetch(API + '/start', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({phone: phone})
-    })
-      .then(function(res){
-        return res.json().catch(function(){ return {}; }).then(function(data){
-          return {ok: res.ok, data: data};
-        });
-      })
-      .then(function(result){
-        if(!result.ok){
-          setError(result.data.error || 'Не удалось получить номер');
-          return;
-        }
-        currentId = result.data.id;
-        el('call-number').textContent = result.data.number;
-        deadline = Date.now() + (result.data.expires_in || 60) * 1000;
-        showStep('step-call');
-        startTicking();
-        startPolling();
-      })
-      .catch(function(){
-        setError('Сеть недоступна. Проверьте соединение и попробуйте снова.');
-      })
-      .then(function(){
-        button.disabled = false;
-        button.textContent = 'Продолжить';
-      });
-  };
-
-  window.resetFlow = function(){
-    stopTimers();
-    currentId = null;
-    setError('');
-    showStep('step-phone');
-  };
-
-  function copyText(text, button){
-    var done = function(){ 
-      var original = button.textContent;
-      button.textContent = 'Скопировано';
-      setTimeout(function(){ button.textContent = original; }, 1500);
-    };
-    if(navigator.clipboard && navigator.clipboard.writeText){
-      navigator.clipboard.writeText(text).then(done, function(){});
-      return;
-    }
-    var area = document.createElement('textarea');
-    area.value = text;
-    document.body.appendChild(area);
-    area.select();
-    try { document.execCommand('copy'); done(); } catch(e) {}
-    document.body.removeChild(area);
-  }
-
-  window.copyNumber = function(button){
-    var value = el('call-number').textContent.replace(/\s+/g, '');
-    copyText(value, button);
-  };
-
-  window.copyCode = function(button){
-    copyText(el('code-value').textContent, button);
-  };
-
-  el('phone').addEventListener('keydown', function(e){
-    if(e.key === 'Enter'){ window.startFlow(); }
-  });
-})();
-</script>
-</body>
-</html>`

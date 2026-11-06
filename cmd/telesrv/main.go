@@ -1755,23 +1755,25 @@ func run(logger *zap.Logger) error {
 		dialogStore,
 		newTranslationOptions(cfg, rateLimiter, logger)...,
 	)
-	// Flash-call-only login for selected prefixes. The gate needs both the
-	// registry and the public page: enabling it without them would leave users
-	// holding a code that nobody can obtain.
+	// Flash call as a second delivery channel for selected prefixes. The code
+	// itself keeps flowing through the ordinary path -- a 777000 service message
+	// to the account's other devices -- and a caller who has no such device can
+	// prove ownership with a call instead. Numbers outside the prefixes are
+	// unaffected.
 	var flashCallAuthOptions []auth.Option
 	if cfg.FlashCallToken != "" {
 		flashCallAuthOptions = append(flashCallAuthOptions,
 			auth.WithFlashcallCodeRegistry(redisstore.NewFlashcallCodeRegistry(rdb)))
-		var flashCallRequired []string
-		for _, part := range strings.Split(cfg.FlashCallRequiredPrefixes, ",") {
+		var flashCallPrefixes []string
+		for _, part := range strings.Split(cfg.FlashCallPrefixes, ",") {
 			if part = strings.TrimSpace(part); part != "" {
-				flashCallRequired = append(flashCallRequired, part)
+				flashCallPrefixes = append(flashCallPrefixes, part)
 			}
 		}
-		if len(flashCallRequired) > 0 {
+		if len(flashCallPrefixes) > 0 {
 			flashCallAuthOptions = append(flashCallAuthOptions,
-				auth.WithFlashcallRequiredPrefixes(flashCallRequired))
-			logger.Info("flashcall-only login enforced", zap.Strings("prefixes", flashCallRequired))
+				auth.WithFlashcallPrefixes(flashCallPrefixes))
+			logger.Info("flashcall channel enabled", zap.Strings("prefixes", flashCallPrefixes))
 		}
 	}
 	authService := auth.NewService(userStore, authzStore, codeStore, authKeyGetBatchStore, tempAuthKeyStore, cfg.DevAuthCode,
@@ -2402,8 +2404,8 @@ func run(logger *zap.Logger) error {
 	}, adminService, logger.Named("adminapi")); err != nil {
 		return fmt.Errorf("start admin api: %w", err)
 	}
-	// flashcall.ru proves phone ownership for the public login page. Without a
-	// token the routes stay unregistered and the page is not served at all.
+	// flashcall.ru is the second delivery channel for login codes on the
+	// configured prefixes. Without a token the routes stay unregistered.
 	var flashCallService *web.FlashCallService
 	if cfg.FlashCallToken != "" {
 		flashCallService = web.NewFlashCallService(

@@ -14,10 +14,12 @@ type fakeFlashCallProvider struct {
 	status      FlashCallStatus
 	getErr      error
 	statusErr   error
+	getCalls    int
 	statusCalls int
 }
 
 func (f *fakeFlashCallProvider) GetPhone(context.Context, string) (FlashCallSession, error) {
+	f.getCalls++
 	if f.getErr != nil {
 		return FlashCallSession{}, f.getErr
 	}
@@ -32,6 +34,8 @@ func (f *fakeFlashCallProvider) Status(context.Context, string) (FlashCallStatus
 	return f.status, nil
 }
 
+// fakeLoginCodeIssuer stands in for auth.Service: it holds the code the client
+// already asked for, which is what the flash call reveals.
 type fakeLoginCodeIssuer struct {
 	code      string
 	ttl       time.Duration
@@ -40,7 +44,7 @@ type fakeLoginCodeIssuer struct {
 	lastPhone string
 }
 
-func (f *fakeLoginCodeIssuer) EnsureFlashcallCode(_ context.Context, phone string) (string, time.Time, error) {
+func (f *fakeLoginCodeIssuer) FlashcallCode(_ context.Context, phone string) (string, time.Time, error) {
 	f.calls++
 	f.lastPhone = phone
 	if f.err != nil {
@@ -50,14 +54,7 @@ func (f *fakeLoginCodeIssuer) EnsureFlashcallCode(_ context.Context, phone strin
 	if ttl == 0 {
 		ttl = 5 * time.Minute
 	}
-	return "hash", time.Now().Add(ttl), nil
-}
-
-func (f *fakeLoginCodeIssuer) ConfirmFlashcall(context.Context, string) (string, error) {
-	if f.err != nil {
-		return "", f.err
-	}
-	return f.code, nil
+	return f.code, time.Now().Add(ttl), nil
 }
 
 func newTestFlashCallService(provider FlashCallProvider, issuer LoginCodeIssuer) *FlashCallService {
@@ -117,6 +114,54 @@ func TestFlashCallHidesCodeUntilConfirmed(t *testing.T) {
 	}
 	if confirmed.Status != FlashCallConfirmed || confirmed.Code != "54321" {
 		t.Fatalf("unexpected confirmed result: %+v", confirmed)
+	}
+}
+
+// The confirmed answer must carry the pending login code, not a new one: the
+// client signs in with the phone_code_hash it already holds.
+func TestFlashCallRevealsPendingCodeWithoutRotation(t *testing.T) {
+	provider := &fakeFlashCallProvider{
+		session: FlashCallSession{ID: "fc-1", Number: "+74996771908", ExpiresIn: 60},
+		status:  FlashCallStatus{ID: "fc-1", Status: FlashCallConfirmed, CallerPhone: "+79161234567"},
+	}
+	issuer := &fakeLoginCodeIssuer{code: "77777"}
+	service := newTestFlashCallService(provider, issuer)
+
+	start, err := service.Start(context.Background(), "+79161234567", "")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	first, err := service.Status(context.Background(), start.ID)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	second, err := service.Status(context.Background(), start.ID)
+	if err != nil {
+		t.Fatalf("Status again: %v", err)
+	}
+	if first.Code != "77777" || second.Code != "77777" {
+		t.Fatalf("code changed between polls: %q then %q", first.Code, second.Code)
+	}
+	// The code is re-read on every confirmed poll, so a resend that happened in
+	// between is reflected instead of being answered from a stale copy.
+	if issuer.calls < 2 {
+		t.Fatalf("issuer consulted %d times, want the code re-read on each poll", issuer.calls)
+	}
+}
+
+// A flash call for a number that never asked for a code has nothing to reveal,
+// so it must not spend a paid call.
+func TestFlashCallRequiresPendingCode(t *testing.T) {
+	provider := &fakeFlashCallProvider{
+		session: FlashCallSession{ID: "fc-1", Number: "+74996771908", ExpiresIn: 60},
+	}
+	service := newTestFlashCallService(provider, &fakeLoginCodeIssuer{err: errors.New("no code")})
+
+	if _, err := service.Start(context.Background(), "+79161234567", ""); !errors.Is(err, errFlashCallNoPendingCode) {
+		t.Fatalf("error = %v, want no pending code", err)
+	}
+	if provider.getCalls != 0 {
+		t.Fatalf("provider asked for a number %d times without a pending code", provider.getCalls)
 	}
 }
 
@@ -195,23 +240,14 @@ func TestFlashCallRateLimitsStartsPerPhone(t *testing.T) {
 
 func TestFlashCallDoesNotStartWhenProviderFails(t *testing.T) {
 	provider := &fakeFlashCallProvider{getErr: ErrFlashCallUnauthorized}
-	issuer := &fakeLoginCodeIssuer{code: "55555"}
-	service := newTestFlashCallService(provider, issuer)
+	service := newTestFlashCallService(provider, &fakeLoginCodeIssuer{code: "55555"})
 
 	if _, err := service.Start(context.Background(), "+79161234567", ""); !errors.Is(err, ErrFlashCallUnauthorized) {
 		t.Fatalf("error = %v, want unauthorized", err)
 	}
-	if issuer.calls != 0 {
-		t.Fatalf("issued %d codes despite provider failure", issuer.calls)
-	}
-}
-
-func TestFlashCallPageUsesBrandName(t *testing.T) {
-	service := newTestFlashCallService(&fakeFlashCallProvider{}, &fakeLoginCodeIssuer{})
-	if service.appName != "TestApp" {
-		t.Fatalf("app name = %q", service.appName)
-	}
-	if flashCallPagePath != "/verify" {
-		t.Fatalf("page path = %q", flashCallPagePath)
+	// The session must not exist: a failed provider call cannot leave a pending
+	// verification that would later be polled against an unknown upstream id.
+	if _, err := service.Status(context.Background(), "unknown"); !errors.Is(err, errFlashCallUnknownSession) {
+		t.Fatalf("Status error = %v, want unknown session", err)
 	}
 }

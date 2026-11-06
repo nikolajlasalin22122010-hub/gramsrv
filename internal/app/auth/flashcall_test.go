@@ -12,7 +12,8 @@ import (
 )
 
 // memFlashcallRegistry is the in-memory twin of the Redis registry used in
-// production; it keeps the same contract so the gate can be tested without one.
+// production; it keeps the same contract so the channel can be tested without
+// one.
 type memFlashcallRegistry struct {
 	mu      sync.Mutex
 	hash    map[string]string
@@ -64,20 +65,20 @@ func (r *memFlashcallRegistry) Drop(_ context.Context, phone, hash string) error
 	return nil
 }
 
-func newGateService(t *testing.T, codes *memory.CodeStore, registry FlashcallCodeRegistry) *Service {
+func newFlashcallService(t *testing.T, codes *memory.CodeStore, registry FlashcallCodeRegistry) *Service {
 	t.Helper()
 	return NewService(memory.NewUserStore(), memory.NewAuthorizationStore(), codes, nil, nil, "12345",
-		WithFlashcallRequiredPrefixes([]string{"+7"}),
+		WithFlashcallPrefixes([]string{"+7"}),
 		WithFlashcallCodeRegistry(registry),
 	)
 }
 
-// The development code must never reach a flash-call-only number: the whole
-// point of the gate is that 12345 stops working for +7.
-func TestFlashcallSendCodeNeverUsesDevelopmentCode(t *testing.T) {
+// A flash-call number still gets a real random code: the code is the secret both
+// channels carry, and the development code would make the call pointless.
+func TestFlashcallNumberGetsRandomCode(t *testing.T) {
 	ctx := context.Background()
 	codes := memory.NewCodeStore()
-	svc := newGateService(t, codes, newMemFlashcallRegistry())
+	svc := newFlashcallService(t, codes, newMemFlashcallRegistry())
 
 	hash, err := svc.SendCode(ctx, "+79161234567")
 	if err != nil {
@@ -90,135 +91,130 @@ func TestFlashcallSendCodeNeverUsesDevelopmentCode(t *testing.T) {
 	if rec.Code == "12345" {
 		t.Fatalf("flashcall number received the development code")
 	}
-	if rec.Channel != store.PhoneCodeChannelSMS {
-		t.Fatalf("channel = %q, want sms", rec.Channel)
+	if rec.Channel != store.PhoneCodeChannelPhone {
+		t.Fatalf("channel = %q, want phone (777000 delivery)", rec.Channel)
 	}
 }
 
-// The gate is scoped: a number outside the configured prefixes keeps the old
-// behaviour, so enabling it cannot break the rest of the world.
-func TestFlashcallGateIsScopedToPrefixes(t *testing.T) {
+// The flash call reveals the code the client already holds a hash for. It must
+// be the same value, not a rotation: a rotation would invalidate the code the
+// user may be reading in the 777000 message.
+func TestFlashcallRevealsTheSameCode(t *testing.T) {
 	ctx := context.Background()
 	codes := memory.NewCodeStore()
-	svc := newGateService(t, codes, newMemFlashcallRegistry())
+	svc := newFlashcallService(t, codes, newMemFlashcallRegistry())
 
-	hash, err := svc.SendCode(ctx, "+4915112345678")
+	hash, err := svc.SendCode(ctx, "+79161234567")
 	if err != nil {
 		t.Fatalf("SendCode: %v", err)
 	}
-	rec, _, err := codes.Get(ctx, hash)
+	issued, _, err := codes.Get(ctx, hash)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if rec.Code != "12345" {
-		t.Fatalf("foreign number code = %q, want the development code", rec.Code)
+	revealed, _, err := svc.FlashcallCode(ctx, "+79161234567")
+	if err != nil {
+		t.Fatalf("FlashcallCode: %v", err)
+	}
+	if revealed != issued.Code {
+		t.Fatalf("flash call revealed %q, the login code is %q", revealed, issued.Code)
 	}
 }
 
-// Knowing the code is not enough before the call: the record already holds a
-// real code, and it must be rejected until the number owner dials the number.
-func TestFlashcallGateRejectsUnconfirmedCode(t *testing.T) {
+// No call is needed to sign in: the 777000 message is a legitimate delivery
+// channel on its own, so the code must pass verification before any call.
+func TestFlashcallCodeNeedsNoConfirmation(t *testing.T) {
 	ctx := context.Background()
 	codes := memory.NewCodeStore()
-	svc := newGateService(t, codes, newMemFlashcallRegistry())
+	svc := newFlashcallService(t, codes, newMemFlashcallRegistry())
 
-	hash, _, err := svc.EnsureFlashcallCode(ctx, "+79161234567")
+	hash, err := svc.SendCode(ctx, "+79161234567")
 	if err != nil {
-		t.Fatalf("EnsureFlashcallCode: %v", err)
+		t.Fatalf("SendCode: %v", err)
 	}
-	rec, found, err := codes.Get(ctx, hash)
-	if err != nil || !found {
-		t.Fatalf("code record missing: %v", err)
-	}
-
-	if _, _, _, err := svc.verifyLoginCode(ctx, normalizePhone("+79161234567"), hash, rec.Code); !errors.Is(err, ErrCodeInvalid) {
-		t.Fatalf("unconfirmed code error = %v, want ErrCodeInvalid", err)
-	}
-}
-
-// Confirmation rotates the code, so the value that existed while the call was in
-// flight is dead, and the rotated one authorizes the same phone_code_hash.
-func TestFlashcallConfirmRotatesAndUnlocks(t *testing.T) {
-	ctx := context.Background()
-	codes := memory.NewCodeStore()
-	svc := newGateService(t, codes, newMemFlashcallRegistry())
-
-	hash, _, err := svc.EnsureFlashcallCode(ctx, "+79161234567")
+	code, _, err := svc.FlashcallCode(ctx, "+79161234567")
 	if err != nil {
-		t.Fatalf("EnsureFlashcallCode: %v", err)
-	}
-	before, _, err := codes.Get(ctx, hash)
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-
-	code, err := svc.ConfirmFlashcall(ctx, "+79161234567")
-	if err != nil {
-		t.Fatalf("ConfirmFlashcall: %v", err)
-	}
-	if code == before.Code {
-		t.Fatalf("code was not rotated on confirmation")
-	}
-	if _, _, _, err := svc.verifyLoginCode(ctx, normalizePhone("+79161234567"), hash, before.Code); !errors.Is(err, ErrCodeInvalid) {
-		t.Fatalf("pre-confirmation code still accepted: %v", err)
+		t.Fatalf("FlashcallCode: %v", err)
 	}
 	if _, _, _, err := svc.verifyLoginCode(ctx, normalizePhone("+79161234567"), hash, code); err != nil {
-		t.Fatalf("confirmed code rejected: %v", err)
+		t.Fatalf("code from the 777000 channel rejected: %v", err)
 	}
 }
 
-// Ensure must reuse the pending hash so a page opened before the client still
-// returns the hash the client will present at auth.signIn.
-func TestFlashcallEnsureReusesPendingHash(t *testing.T) {
+// The channel is scoped: a number outside the prefixes has no phone->hash
+// binding, so there is nothing for a flash call to reveal.
+func TestFlashcallChannelIsScopedToPrefixes(t *testing.T) {
 	ctx := context.Background()
 	codes := memory.NewCodeStore()
-	svc := newGateService(t, codes, newMemFlashcallRegistry())
+	svc := newFlashcallService(t, codes, newMemFlashcallRegistry())
+
+	if _, err := svc.SendCode(ctx, "+4915112345678"); err != nil {
+		t.Fatalf("SendCode: %v", err)
+	}
+	if _, _, err := svc.FlashcallCode(ctx, "+4915112345678"); !errors.Is(err, ErrCodeExpired) {
+		t.Fatalf("foreign number flash call error = %v, want ErrCodeExpired", err)
+	}
+}
+
+// Resend replaces the pending code, so the flash call must follow the newest
+// hash instead of revealing a dead one.
+func TestFlashcallBindingFollowsResend(t *testing.T) {
+	ctx := context.Background()
+	codes := memory.NewCodeStore()
+	svc := newFlashcallService(t, codes, newMemFlashcallRegistry())
 
 	first, err := svc.SendCode(ctx, "+79161234567")
 	if err != nil {
 		t.Fatalf("SendCode: %v", err)
 	}
-	second, _, err := svc.EnsureFlashcallCode(ctx, "+79161234567")
+	second, err := svc.ResendCode(ctx, "+79161234567", first)
 	if err != nil {
-		t.Fatalf("EnsureFlashcallCode: %v", err)
+		t.Fatalf("ResendCode: %v", err)
 	}
-	if first != second {
-		t.Fatalf("hash changed between client and page: %q vs %q", first, second)
+	code, _, err := svc.FlashcallCode(ctx, "+79161234567")
+	if err != nil {
+		t.Fatalf("FlashcallCode after resend: %v", err)
+	}
+	fresh, found, err := codes.Get(ctx, second)
+	if err != nil || !found {
+		t.Fatalf("resent code missing: %v", err)
+	}
+	if code != fresh.Code {
+		t.Fatalf("flash call revealed %q, the resent code is %q", code, fresh.Code)
+	}
+	if _, _, _, err := svc.verifyLoginCode(ctx, normalizePhone("+79161234567"), first, code); err == nil {
+		t.Fatalf("the superseded hash still accepted the resent code")
 	}
 }
 
-// Without a registry the gate must fail closed rather than accept a code.
-func TestFlashcallGateFailsClosedWithoutRegistry(t *testing.T) {
+// Without a registry the channel is unavailable rather than silently useless.
+func TestFlashcallCodeFailsWithoutRegistry(t *testing.T) {
 	ctx := context.Background()
 	codes := memory.NewCodeStore()
 	svc := NewService(memory.NewUserStore(), memory.NewAuthorizationStore(), codes, nil, nil, "12345",
-		WithFlashcallRequiredPrefixes([]string{"+7"}))
+		WithFlashcallPrefixes([]string{"+7"}))
 
-	if _, _, err := svc.EnsureFlashcallCode(ctx, "+79161234567"); !errors.Is(err, ErrFlashcallUnavailable) {
-		t.Fatalf("Ensure error = %v, want ErrFlashcallUnavailable", err)
+	if _, err := svc.SendCode(ctx, "+79161234567"); err != nil {
+		t.Fatalf("SendCode: %v", err)
 	}
-	confirmed, err := svc.flashcallConfirmed(ctx, "+79161234567", "hash")
-	if err != nil {
-		t.Fatalf("flashcallConfirmed: %v", err)
-	}
-	if confirmed {
-		t.Fatalf("missing registry reported a confirmed number")
+	if _, _, err := svc.FlashcallCode(ctx, "+79161234567"); !errors.Is(err, ErrFlashcallUnavailable) {
+		t.Fatalf("FlashcallCode error = %v, want ErrFlashcallUnavailable", err)
 	}
 }
 
-func TestFlashcallRequiredPrefixMatching(t *testing.T) {
+func TestFlashcallPrefixMatching(t *testing.T) {
 	svc := &Service{}
 	// "+7" and "7" must be interchangeable: canonical phones carry no plus.
-	WithFlashcallRequiredPrefixes([]string{" +7 ", "", "+375"})(svc)
+	WithFlashcallPrefixes([]string{" +7 ", "", "+375"})(svc)
 	for _, phone := range []string{"+79161234567", "+375291234567"} {
-		if !svc.flashcallRequiredFor(normalizePhone(phone)) {
-			t.Errorf("%s should require flashcall", phone)
+		if !svc.flashcallAppliesTo(normalizePhone(phone)) {
+			t.Errorf("%s should have the flashcall channel", phone)
 		}
 	}
-	if svc.flashcallRequiredFor(normalizePhone("+4915112345678")) {
-		t.Errorf("+49 should not require flashcall")
+	if svc.flashcallAppliesTo(normalizePhone("+4915112345678")) {
+		t.Errorf("+49 should not have the flashcall channel")
 	}
-	if (&Service{}).flashcallRequiredFor(normalizePhone("+79161234567")) {
-		t.Errorf("an unconfigured service must not require flashcall")
+	if (&Service{}).flashcallAppliesTo(normalizePhone("+79161234567")) {
+		t.Errorf("an unconfigured service must not expose the channel")
 	}
 }
