@@ -2378,6 +2378,21 @@ func run(logger *zap.Logger) error {
 	}, adminService, logger.Named("adminapi")); err != nil {
 		return fmt.Errorf("start admin api: %w", err)
 	}
+	// flashcall.ru proves phone ownership for the public login page. Without a
+	// token the routes stay unregistered and the page is not served at all.
+	var flashCallService *web.FlashCallService
+	if cfg.FlashCallToken != "" {
+		flashCallService = web.NewFlashCallService(
+			web.NewHTTPFlashCallProvider(cfg.FlashCallAPIBase, cfg.FlashCallToken, cfg.FlashCallTimeout),
+			authService,
+			cfg.FlashCallPrefixes,
+			cfg.PublicAppName,
+			logger.Named("flashcall"),
+		)
+		logger.Info("flashcall phone verification enabled",
+			zap.String("api_base", cfg.FlashCallAPIBase),
+			zap.String("prefixes", cfg.FlashCallPrefixes))
+	}
 	if _, err := web.Start(ctx, web.Config{
 		Addr:               cfg.PublicLinkWebAddr,
 		PublicBaseURL:      cfg.PublicBaseURL,
@@ -2386,6 +2401,7 @@ func run(logger *zap.Logger) error {
 		WebBaseURL:         cfg.PublicWebBaseURL,
 		AppName:            cfg.PublicAppName,
 		AllowDevPayments:   cfg.AllowDevPayments,
+		FlashCall:          flashCallService,
 		StickerSets:        filesService,
 		Users:              userStore,
 		Channels:           channelStore,

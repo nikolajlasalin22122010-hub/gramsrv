@@ -50,6 +50,9 @@ type Config struct {
 	// the listener so discovery/auth/token and public links share the exact
 	// externally registered origin behind one reverse proxy.
 	TelegramLogin http.Handler
+	// FlashCall is the optional phone-ownership verification behind the public
+	// login page. A nil value leaves its routes unregistered.
+	FlashCall *FlashCallService
 }
 
 type StickerSetResolver interface {
@@ -198,6 +201,7 @@ func newHandler(cfg Config, logger *zap.Logger) (http.Handler, error) {
 		webBaseURL:         cfg.WebBaseURL,
 		appName:            cfg.AppName,
 		allowDevPayments:   cfg.AllowDevPayments,
+		flashCall:          cfg.FlashCall,
 		logger:             logger,
 	}
 	mux := http.NewServeMux()
@@ -209,6 +213,11 @@ func newHandler(cfg Config, logger *zap.Logger) (http.Handler, error) {
 		mux.HandleFunc("GET /payments/dev-stars", h.devStarsCheckout)
 	}
 	mux.HandleFunc("GET /_public/avatar/{username}/{photoID}", h.publicAvatar)
+	if cfg.FlashCall != nil {
+		mux.HandleFunc("POST /v1/flashcall/start", cfg.FlashCall.HandleStart)
+		mux.HandleFunc("GET /v1/flashcall/status", cfg.FlashCall.HandleStatus)
+		mux.HandleFunc("GET "+flashCallPagePath, cfg.FlashCall.HandlePage)
+	}
 	mux.HandleFunc("GET /addstickers/{shortName}", h.addStickers)
 	mux.HandleFunc("GET /addemoji/{shortName}", h.addEmoji)
 	mux.HandleFunc("GET /addlist/{slug}", h.addList)
@@ -349,6 +358,7 @@ type handler struct {
 	webBaseURL         string
 	appName            string
 	allowDevPayments   bool
+	flashCall          *FlashCallService
 	logger             *zap.Logger
 }
 

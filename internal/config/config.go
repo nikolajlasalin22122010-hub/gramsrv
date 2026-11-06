@@ -318,6 +318,12 @@ type Config struct {
 	OTPWebhookURL     string
 	OTPWebhookSecret  string
 	OTPWebhookTimeout time.Duration
+	// FlashCall* configure the flashcall.ru phone-ownership check behind the
+	// public login page. The feature stays off while FlashCallToken is empty.
+	FlashCallToken    string
+	FlashCallAPIBase  string
+	FlashCallTimeout  time.Duration
+	FlashCallPrefixes string
 	// ASRURL/ASRTimeout point at the local ASR HTTP backend (whisper-server's /inference).
 	// If URL is empty speech-to-text is unavailable and messages.transcribeAudio returns TRANSCRIPTION_FAILED explicitly.
 	ASRURL     string
@@ -1153,6 +1159,10 @@ func Load() (Config, error) {
 		OTPWebhookURL:                     envOr("TELESRV_OTP_WEBHOOK_URL", ""),
 		OTPWebhookSecret:                  envOr("TELESRV_OTP_WEBHOOK_SECRET", ""),
 		OTPWebhookTimeout:                 envDurationOr("TELESRV_OTP_WEBHOOK_TIMEOUT", 5*time.Second),
+		FlashCallToken:                    strings.TrimSpace(envOr("TELESRV_FLASHCALL_TOKEN", "")),
+		FlashCallAPIBase:                  strings.TrimSpace(envOr("TELESRV_FLASHCALL_API_BASE", "https://flashcall.ru/api/v1")),
+		FlashCallTimeout:                  envDurationOr("TELESRV_FLASHCALL_TIMEOUT", 10*time.Second),
+		FlashCallPrefixes:                 envOr("TELESRV_FLASHCALL_PREFIXES", "+7"),
 		ASRURL:                            strings.TrimSpace(envOr("TELESRV_ASR_URL", "")),
 		ASRTimeout:                        envDurationOr("TELESRV_ASR_TIMEOUT", 120*time.Second),
 		SMTPHost:                          envOr("TELESRV_SMTP_HOST", ""),
