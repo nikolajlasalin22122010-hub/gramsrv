@@ -68,7 +68,12 @@ type FlashCallProvider interface {
 // LoginCodeIssuer issues a login code without delivering it, so the Web layer
 // can reveal it only after a flash call proves phone ownership.
 type LoginCodeIssuer interface {
-	IssueOutOfBandCode(ctx context.Context, phone string) (hash, code string, expiresAt time.Time, err error)
+	// EnsureFlashcallCode returns the pending login-code hash for phone,
+	// creating the record on first use. The code itself is never returned
+	// here: it only becomes usable after ConfirmFlashcall rotates it.
+	EnsureFlashcallCode(ctx context.Context, phone string) (hash string, expiresAt time.Time, err error)
+	// ConfirmFlashcall rotates the pending code and marks the number proven.
+	ConfirmFlashcall(ctx context.Context, phone string) (code string, err error)
 }
 
 // HTTPFlashCallProvider talks to the flashcall.ru JSON API.
@@ -203,6 +208,9 @@ type flashCallPending struct {
 	createdAt   time.Time
 	expiresAt   time.Time
 	confirmed   bool
+	// confirming guards against two concurrent polls rotating the code twice
+	// and handing out a value that the second rotation already invalidated.
+	confirming bool
 }
 
 // FlashCallService binds a login code to a phone-ownership proof: the code is
@@ -283,7 +291,7 @@ func (s *FlashCallService) Start(ctx context.Context, rawPhone, ip string) (flas
 	if err != nil {
 		return flashCallStartResult{}, err
 	}
-	_, code, expiresAt, err := s.issuer.IssueOutOfBandCode(ctx, phone)
+	_, expiresAt, err := s.issuer.EnsureFlashcallCode(ctx, phone)
 	if err != nil {
 		return flashCallStartResult{}, err
 	}
@@ -295,7 +303,6 @@ func (s *FlashCallService) Start(ctx context.Context, rawPhone, ip string) (flas
 		id:          id,
 		phone:       phone,
 		flashcallID: session.ID,
-		code:        code,
 		number:      session.Number,
 		createdAt:   now,
 		expiresAt:   expiresAt,
@@ -360,10 +367,40 @@ func (s *FlashCallService) Status(ctx context.Context, id string) (flashCallStat
 			return flashCallStatusResult{Status: FlashCallExpired}, nil
 		}
 		s.mu.Lock()
-		if current := s.pending[id]; current != nil {
-			current.confirmed = true
+		current := s.pending[id]
+		if current == nil {
+			s.mu.Unlock()
+			return flashCallStatusResult{}, errFlashCallUnknownSession
 		}
-		code := record.code
+		if current.confirmed {
+			code := current.code
+			s.mu.Unlock()
+			return flashCallStatusResult{Status: FlashCallConfirmed, Code: code}, nil
+		}
+		if current.confirming {
+			s.mu.Unlock()
+			return flashCallStatusResult{Status: FlashCallPending}, nil
+		}
+		current.confirming = true
+		s.mu.Unlock()
+
+		// Rotate only now: the code that existed while the call was in flight
+		// was never shown to anyone and must not survive confirmation.
+		code, err := s.issuer.ConfirmFlashcall(ctx, phone)
+		if err != nil {
+			s.mu.Lock()
+			if cur := s.pending[id]; cur != nil {
+				cur.confirming = false
+			}
+			s.mu.Unlock()
+			return flashCallStatusResult{}, err
+		}
+		s.mu.Lock()
+		if cur := s.pending[id]; cur != nil {
+			cur.confirmed = true
+			cur.confirming = false
+			cur.code = code
+		}
 		s.mu.Unlock()
 		s.logger.Info("flashcall verification confirmed", zap.String("verification_id", id))
 		return flashCallStatusResult{Status: FlashCallConfirmed, Code: code}, nil

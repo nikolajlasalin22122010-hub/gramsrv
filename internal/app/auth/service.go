@@ -82,25 +82,31 @@ func systemLoginPhoneForbidden(phone string) bool {
 // External delivery for existing accounts is an additional channel to the durable 777000 App-code and must
 // not replace or weaken the original message fact.
 type Service struct {
-	users                  store.UserStore
-	auths                  store.AuthorizationStore
-	codes                  store.CodeStore
-	authKeys               store.AuthKeyStore
-	tempKeys               store.TempAuthKeyBindingStore
-	passwords              store.PasswordStore
-	messages               store.MessageStore
-	dialogs                store.DialogStore
-	loginCodeDelivery      store.LoginCodeDeliveryStore
-	loginCodeTemplate      func() (string, error)
-	bots                   store.BotStore
-	fixedCode              string
-	codeTTL                time.Duration
-	codeMaxAttempts        int
-	loginEmails            loginEmailStore
-	loginEmailSender       otpdelivery.Sender
-	phoneCodeSender        otpdelivery.Sender
-	otpDeliveryFailure     func(context.Context, otpdelivery.Request, error)
-	phoneCodeLength        int
+	users              store.UserStore
+	auths              store.AuthorizationStore
+	codes              store.CodeStore
+	authKeys           store.AuthKeyStore
+	tempKeys           store.TempAuthKeyBindingStore
+	passwords          store.PasswordStore
+	messages           store.MessageStore
+	dialogs            store.DialogStore
+	loginCodeDelivery  store.LoginCodeDeliveryStore
+	loginCodeTemplate  func() (string, error)
+	bots               store.BotStore
+	fixedCode          string
+	codeTTL            time.Duration
+	codeMaxAttempts    int
+	loginEmails        loginEmailStore
+	loginEmailSender   otpdelivery.Sender
+	phoneCodeSender    otpdelivery.Sender
+	otpDeliveryFailure func(context.Context, otpdelivery.Request, error)
+	phoneCodeLength    int
+	// flashcallPrefixes lists E.164 prefixes whose login codes are never
+	// delivered: only the flash-call page can reveal them.
+	flashcallPrefixes []string
+	// flashcallRegistry is the phone->hash index backing that gate. Nil keeps
+	// the feature off entirely.
+	flashcallRegistry      FlashcallCodeRegistry
 	loginEmailEnabled      bool
 	loginEmailRequireSetup bool
 	loginEmailCodeLength   int
@@ -478,6 +484,13 @@ func (s *Service) SendCode(ctx context.Context, phone string) (string, error) {
 	if found {
 		issuedUserID = existing.ID
 	}
+	// A flash-call-only prefix must never fall through to SMS, to an email
+	// code or to the fixed development code: the code stays server-side
+	// until the caller proves ownership of the number.
+	if s.flashcallRequiredFor(phone) {
+		hash, _, err := s.EnsureFlashcallCode(ctx, phone)
+		return hash, err
+	}
 	if s.loginEmailEnabled && s.loginEmails != nil {
 		email, found, err := s.loginEmails.LoginEmailByPhone(ctx, phone)
 		if err != nil {
@@ -531,6 +544,12 @@ func (s *Service) invalidateLoginCodeDetached(ctx context.Context, hash, phone s
 }
 
 func (s *Service) createPhoneCode(ctx context.Context, phone string, existingUserID int64) (string, error) {
+	// Resend and every other path that issues a login code funnels here, so
+	// the flash-call gate belongs at the top rather than at each caller.
+	if s.flashcallRequiredFor(phone) {
+		hash, _, err := s.EnsureFlashcallCode(ctx, phone)
+		return hash, err
+	}
 	hash, err := randomHex(8)
 	if err != nil {
 		return "", err
@@ -1106,6 +1125,18 @@ func (s *Service) verifyLoginCode(ctx context.Context, phone, phoneCodeHash, cod
 	}
 	if !store.LoginCodeChannelVerifiable(rec.Channel) {
 		return store.PhoneCode{}, domain.User{}, false, ErrCodeInvalid
+	}
+	// For a flash-call-only prefix the code is never delivered, so knowing it
+	// is not enough: the owner of the number must have completed the call.
+	// A missing registry fails closed instead of silently trusting the code.
+	if s.flashcallRequiredFor(phone) {
+		confirmed, err := s.flashcallConfirmed(ctx, phone, phoneCodeHash)
+		if err != nil {
+			return store.PhoneCode{}, domain.User{}, false, err
+		}
+		if !confirmed {
+			return store.PhoneCode{}, domain.User{}, false, ErrCodeInvalid
+		}
 	}
 
 	before, beforeFound, err := s.currentPhoneOwner(ctx, phone)

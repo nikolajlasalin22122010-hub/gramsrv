@@ -40,17 +40,24 @@ type fakeLoginCodeIssuer struct {
 	lastPhone string
 }
 
-func (f *fakeLoginCodeIssuer) IssueOutOfBandCode(_ context.Context, phone string) (string, string, time.Time, error) {
+func (f *fakeLoginCodeIssuer) EnsureFlashcallCode(_ context.Context, phone string) (string, time.Time, error) {
 	f.calls++
 	f.lastPhone = phone
 	if f.err != nil {
-		return "", "", time.Time{}, f.err
+		return "", time.Time{}, f.err
 	}
 	ttl := f.ttl
 	if ttl == 0 {
 		ttl = 5 * time.Minute
 	}
-	return "hash", f.code, time.Now().Add(ttl), nil
+	return "hash", time.Now().Add(ttl), nil
+}
+
+func (f *fakeLoginCodeIssuer) ConfirmFlashcall(context.Context, string) (string, error) {
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.code, nil
 }
 
 func newTestFlashCallService(provider FlashCallProvider, issuer LoginCodeIssuer) *FlashCallService {

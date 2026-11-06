@@ -324,6 +324,10 @@ type Config struct {
 	FlashCallAPIBase  string
 	FlashCallTimeout  time.Duration
 	FlashCallPrefixes string
+	// FlashCallRequiredPrefixes lists E.164 prefixes whose login codes may
+	// only be obtained through the flash-call page. Empty keeps the page
+	// optional and every code deliverable as before.
+	FlashCallRequiredPrefixes string
 	// ASRURL/ASRTimeout point at the local ASR HTTP backend (whisper-server's /inference).
 	// If URL is empty speech-to-text is unavailable and messages.transcribeAudio returns TRANSCRIPTION_FAILED explicitly.
 	ASRURL     string
@@ -1163,6 +1167,7 @@ func Load() (Config, error) {
 		FlashCallAPIBase:                  strings.TrimSpace(envOr("TELESRV_FLASHCALL_API_BASE", "https://flashcall.ru/api/v1")),
 		FlashCallTimeout:                  envDurationOr("TELESRV_FLASHCALL_TIMEOUT", 10*time.Second),
 		FlashCallPrefixes:                 envOr("TELESRV_FLASHCALL_PREFIXES", "+7"),
+		FlashCallRequiredPrefixes:         envOr("TELESRV_FLASHCALL_REQUIRED_PREFIXES", ""),
 		ASRURL:                            strings.TrimSpace(envOr("TELESRV_ASR_URL", "")),
 		ASRTimeout:                        envDurationOr("TELESRV_ASR_TIMEOUT", 120*time.Second),
 		SMTPHost:                          envOr("TELESRV_SMTP_HOST", ""),

@@ -48,11 +48,11 @@ import (
 	groupcallsapp "telesrv/internal/app/groupcalls"
 	"telesrv/internal/app/help"
 	"telesrv/internal/app/langpack"
-	opsapp "telesrv/internal/app/ops"
 	"telesrv/internal/app/livestream"
 	"telesrv/internal/app/maintenance"
 	messageapp "telesrv/internal/app/messages"
 	moderationapp "telesrv/internal/app/moderation"
+	opsapp "telesrv/internal/app/ops"
 	passkeyapp "telesrv/internal/app/passkey"
 	"telesrv/internal/app/payments"
 	phoneapp "telesrv/internal/app/phone"
@@ -1755,6 +1755,25 @@ func run(logger *zap.Logger) error {
 		dialogStore,
 		newTranslationOptions(cfg, rateLimiter, logger)...,
 	)
+	// Flash-call-only login for selected prefixes. The gate needs both the
+	// registry and the public page: enabling it without them would leave users
+	// holding a code that nobody can obtain.
+	var flashCallAuthOptions []auth.Option
+	if cfg.FlashCallToken != "" {
+		flashCallAuthOptions = append(flashCallAuthOptions,
+			auth.WithFlashcallCodeRegistry(redisstore.NewFlashcallCodeRegistry(rdb)))
+		var flashCallRequired []string
+		for _, part := range strings.Split(cfg.FlashCallRequiredPrefixes, ",") {
+			if part = strings.TrimSpace(part); part != "" {
+				flashCallRequired = append(flashCallRequired, part)
+			}
+		}
+		if len(flashCallRequired) > 0 {
+			flashCallAuthOptions = append(flashCallAuthOptions,
+				auth.WithFlashcallRequiredPrefixes(flashCallRequired))
+			logger.Info("flashcall-only login enforced", zap.Strings("prefixes", flashCallRequired))
+		}
+	}
 	authService := auth.NewService(userStore, authzStore, codeStore, authKeyGetBatchStore, tempAuthKeyStore, cfg.DevAuthCode,
 		auth.WithLoginMessages(messageStore, dialogStore),
 		auth.WithLoginCodeDelivery(messageStore),
@@ -1816,6 +1835,11 @@ func run(logger *zap.Logger) error {
 			Store:        accountService,
 			Sender:       loginEmailSender,
 		}))
+	// Applied after construction because Go does not allow mixing fixed
+	// arguments with a spread slice in one call.
+	for _, opt := range flashCallAuthOptions {
+		opt(authService)
+	}
 	// Collectible (NFT) usernames and the gramsrv composite account rating are
 	// optional read models projected at the protocol edge. The rating worker
 	// computes and persists scores; profile reads never recompute them.
