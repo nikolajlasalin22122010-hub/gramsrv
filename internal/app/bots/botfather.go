@@ -431,9 +431,12 @@ func (s *Service) stepPrompt(state domain.BotChatState) botReply {
 
 func (s *Service) handleBotFatherCommand(ctx context.Context, userID int64, cmd string) botReply {
 	switch cmd {
-	case "start", "help":
+	case "start":
 		_ = s.bots.DeleteBotChatState(ctx, domain.BotFatherUserID, userID)
-		return botReply{Text: botFatherHelpText()}
+		return botFatherMenuReply()
+	case "help":
+		_ = s.bots.DeleteBotChatState(ctx, domain.BotFatherUserID, userID)
+		return botReply{Text: botFatherHelpText(), ReplyMarkup: botFatherMenuKeyboard()}
 	case "cancel":
 		state, found, err := s.bots.GetBotChatState(ctx, domain.BotFatherUserID, userID)
 		if err != nil {
@@ -473,15 +476,7 @@ func (s *Service) handleBotFatherCommand(ctx context.Context, userID int64, cmd 
 		}
 		return botReply{Text: "Alright, a new bot. How are we going to call it? Please choose a name for your bot."}
 	case "mybots":
-		usernames, err := s.ownedBotUsernames(ctx, userID)
-		if err != nil {
-			s.log.Error("botfather: list bots", zap.Int64("user_id", userID), zap.Error(err))
-			return internalReply()
-		}
-		if len(usernames) == 0 {
-			return botReply{Text: "You don't have any bots yet. Use /newbot to create one."}
-		}
-		return botReply{Text: "Here are your bots:\n\n@" + strings.Join(usernames, "\n@")}
+		return s.botFatherBotsListReply(ctx, userID)
 	case botFatherCmdToken, botFatherCmdRevoke, botFatherCmdDeleteBot,
 		botFatherCmdSetName, botFatherCmdSetDescription, botFatherCmdSetAbout,
 		botFatherCmdSetCommands, botFatherCmdSetInline, botFatherCmdSetInlineGeo,
@@ -1264,6 +1259,252 @@ func (s *Service) clearState(ctx context.Context, userID int64) {
 	if err := s.bots.DeleteBotChatState(ctx, domain.BotFatherUserID, userID); err != nil {
 		s.log.Error("botfather: delete chat state", zap.Int64("user_id", userID), zap.Error(err))
 	}
+}
+
+// --- inline menu -------------------------------------------------------------
+//
+// BotFather used to answer /mybots with a plain list of @usernames: the user had
+// to read the list and type one of the names back. The menu below is the same
+// data as an inline keyboard, so every step -- picking a bot, choosing what to
+// change, going back to the list -- is a button, the way the official BotFather
+// behaves.
+//
+// Callback data carries no authority. It names a bot id, and every handler
+// re-resolves that id against the caller's own bots before doing anything, so a
+// forged or replayed button can at worst hit a bot the caller already owns.
+
+const botFatherCallbackPrefix = "bf"
+
+// botFatherBotActions is the set of per-bot actions the card may carry. It is
+// the allow-list the callback parser checks before a button can start a command.
+var botFatherBotActions = map[string]bool{
+	botFatherCmdToken: true, botFatherCmdRevoke: true, botFatherCmdDeleteBot: true,
+	botFatherCmdSetName: true, botFatherCmdSetDescription: true, botFatherCmdSetAbout: true,
+	botFatherCmdSetCommands: true, botFatherCmdSetInline: true, botFatherCmdSetInlineGeo: true,
+	botFatherCmdSetJoinGroups: true, botFatherCmdSetPrivacy: true,
+	botFatherCmdSetLogin: true, botFatherCmdLoginInfo: true, botFatherCmdResetLogin: true,
+}
+
+func botFatherInlineMarkup(rows [][]domain.MarkupButton) *domain.MessageReplyMarkup {
+	return &domain.MessageReplyMarkup{Type: domain.MessageReplyMarkupInline, Inline: rows}
+}
+
+func botFatherCallbackButton(text, data string) domain.MarkupButton {
+	return domain.MarkupButton{
+		Type: domain.MarkupButtonCallback,
+		Text: text,
+		Data: []byte(botFatherCallbackPrefix + ":" + data),
+	}
+}
+
+// botFatherMenuKeyboard is the top-level menu: the two things a bot owner does
+// most often, plus the command reference for everything else.
+func botFatherMenuKeyboard() *domain.MessageReplyMarkup {
+	return botFatherInlineMarkup([][]domain.MarkupButton{
+		{botFatherCallbackButton("My bots", "list"), botFatherCallbackButton("New bot", "new")},
+		{botFatherCallbackButton("All commands", "help")},
+	})
+}
+
+func botFatherMenuReply() botReply {
+	return botReply{
+		Text: "I can help you create and manage " + branding.ProductName() +
+			" bots.\n\nPick an action below, or send /help for the full command list.",
+		ReplyMarkup: botFatherMenuKeyboard(),
+	}
+}
+
+// botFatherBotsListReply renders the owner's bots as buttons, one per row.
+func (s *Service) botFatherBotsListReply(ctx context.Context, userID int64) botReply {
+	owned, err := s.ownedBots(ctx, userID)
+	if err != nil {
+		s.log.Error("botfather: list bots", zap.Int64("user_id", userID), zap.Error(err))
+		return internalReply()
+	}
+	if len(owned) == 0 {
+		return botReply{
+			Text: "You don't have any bots yet.",
+			ReplyMarkup: botFatherInlineMarkup([][]domain.MarkupButton{
+				{botFatherCallbackButton("Create a bot", "new")},
+				{botFatherCallbackButton("Menu", "menu")},
+			}),
+		}
+	}
+	rows := make([][]domain.MarkupButton, 0, len(owned)+2)
+	for _, b := range owned {
+		label := b.user.Username
+		if label == "" {
+			label = b.user.FirstName
+		}
+		rows = append(rows, []domain.MarkupButton{
+			botFatherCallbackButton("@"+label, fmt.Sprintf("bot:%d", b.user.ID)),
+		})
+	}
+	rows = append(rows,
+		[]domain.MarkupButton{botFatherCallbackButton("New bot", "new"), botFatherCallbackButton("Menu", "menu")},
+	)
+	return botReply{
+		Text:        fmt.Sprintf("Your bots: %d. Pick one to manage.", len(owned)),
+		ReplyMarkup: botFatherInlineMarkup(rows),
+	}
+}
+
+// botFatherBotCardReply is the per-bot screen: current settings in the text, one
+// button per thing that can be changed.
+func (s *Service) botFatherBotCardReply(ctx context.Context, userID, botID int64) botReply {
+	target, ok := s.ownedBotByID(ctx, userID, botID)
+	if !ok {
+		return botFatherStaleBotReply()
+	}
+	username := target.user.Username
+	if username == "" {
+		username = target.user.FirstName
+	}
+	inlineMode := "disabled"
+	if target.profile.InlinePlaceholder != "" {
+		inlineMode = "enabled"
+	}
+	groups := "allowed"
+	if target.profile.Nochats {
+		groups = "blocked"
+	}
+	privacy := "enabled"
+	if target.profile.ChatHistory {
+		privacy = "disabled"
+	}
+	location := "disabled"
+	if target.profile.InlineGeo {
+		location = "enabled"
+	}
+	text := fmt.Sprintf("@%s — %s\n\nInline mode: %s\nLocation requests: %s\nGroups: %s\nPrivacy mode: %s\n\nWhat do you want to change?",
+		username, target.user.FirstName, inlineMode, location, groups, privacy)
+	do := func(label, cmd string) domain.MarkupButton {
+		return botFatherCallbackButton(label, fmt.Sprintf("do:%s:%d", cmd, botID))
+	}
+	return botReply{
+		Text: text,
+		ReplyMarkup: botFatherInlineMarkup([][]domain.MarkupButton{
+			{do("Token", botFatherCmdToken), do("Revoke token", botFatherCmdRevoke)},
+			{do("Name", botFatherCmdSetName), do("Description", botFatherCmdSetDescription)},
+			{do("About", botFatherCmdSetAbout), do("Commands", botFatherCmdSetCommands)},
+			{do("Inline mode", botFatherCmdSetInline), do("Location", botFatherCmdSetInlineGeo)},
+			{do("Groups", botFatherCmdSetJoinGroups), do("Privacy", botFatherCmdSetPrivacy)},
+			{do("Delete bot", botFatherCmdDeleteBot)},
+			{botFatherCallbackButton("Back", "list"), botFatherCallbackButton("Menu", "menu")},
+		}),
+	}
+}
+
+// ownedBotByID resolves a callback's bot id against the caller's own bots. Every
+// button handler goes through it; nothing trusts the id on its own.
+func (s *Service) ownedBotByID(ctx context.Context, ownerUserID, botID int64) (ownedBot, bool) {
+	if botID <= 0 {
+		return ownedBot{}, false
+	}
+	owned, err := s.ownedBots(ctx, ownerUserID)
+	if err != nil {
+		s.log.Error("botfather: list bots", zap.Int64("user_id", ownerUserID), zap.Error(err))
+		return ownedBot{}, false
+	}
+	for _, b := range owned {
+		if b.user.ID == botID {
+			return b, true
+		}
+	}
+	return ownedBot{}, false
+}
+
+func botFatherStaleBotReply() botReply {
+	return botReply{
+		Text: "That bot is not yours or no longer exists.",
+		ReplyMarkup: botFatherInlineMarkup([][]domain.MarkupButton{
+			{botFatherCallbackButton("My bots", "list")},
+		}),
+	}
+}
+
+// applyBotFatherButton runs the command a card button stands for. It reuses the
+// choose-step entry point, so a button and a typed /command followed by a
+// username end in exactly the same state machine.
+func (s *Service) applyBotFatherButton(ctx context.Context, userID int64, cmd string, botID int64) botReply {
+	target, ok := s.ownedBotByID(ctx, userID, botID)
+	if !ok {
+		return botFatherStaleBotReply()
+	}
+	state := domain.BotChatState{
+		BotUserID: domain.BotFatherUserID,
+		UserID:    userID,
+		Command:   cmd,
+		Step:      botFatherStepChoose,
+	}
+	if err := s.bots.UpsertBotChatState(ctx, state); err != nil {
+		s.log.Error("botfather: save chat state", zap.Int64("user_id", userID), zap.Error(err))
+		return internalReply()
+	}
+	return s.applyBotChoice(ctx, state, target.user)
+}
+
+// parseBotFatherCallback splits "bf:<action>[:<arg>]" without allocating a
+// general-purpose parser: the data is a fixed two-part shape.
+func parseBotFatherCallback(data []byte) (action, arg string, ok bool) {
+	raw := string(data)
+	prefix := botFatherCallbackPrefix + ":"
+	if !strings.HasPrefix(raw, prefix) {
+		return "", "", false
+	}
+	action, arg, _ = strings.Cut(strings.TrimPrefix(raw, prefix), ":")
+	if action == "" {
+		return "", "", false
+	}
+	return action, arg, true
+}
+
+// onBotFatherCallback answers a menu click. Like every built-in bot it replies
+// synchronously and sends a new message rather than editing the old one: the
+// panel keeps the history of what was asked and answered.
+func (s *Service) onBotFatherCallback(ctx context.Context, query domain.BotCallbackQuery) (domain.BotCallbackAnswer, bool, error) {
+	userID := query.UserID
+	mu := s.serviceBotReplyLock(domain.BotFatherUserID, userID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	action, arg, ok := parseBotFatherCallback(query.Data)
+	if !ok {
+		return domain.BotCallbackAnswer{
+			Message: "This button is out of date. Send /start to open the menu again.",
+			Alert:   true,
+		}, true, nil
+	}
+	var reply botReply
+	switch action {
+	case "menu":
+		reply = botFatherMenuReply()
+	case "help":
+		reply = botReply{Text: botFatherHelpText(), ReplyMarkup: botFatherMenuKeyboard()}
+	case "list":
+		reply = s.botFatherBotsListReply(ctx, userID)
+	case "new":
+		reply = s.handleBotFatherCommand(ctx, userID, botFatherCmdNewBot)
+	case "bot":
+		botID, err := strconv.ParseInt(arg, 10, 64)
+		if err != nil {
+			reply = botFatherStaleBotReply()
+			break
+		}
+		reply = s.botFatherBotCardReply(ctx, userID, botID)
+	case "do":
+		cmd, idPart, found := strings.Cut(arg, ":")
+		botID, err := strconv.ParseInt(idPart, 10, 64)
+		if !found || err != nil || !botFatherBotActions[cmd] {
+			reply = botFatherStaleBotReply()
+			break
+		}
+		reply = s.applyBotFatherButton(ctx, userID, cmd, botID)
+	default:
+		reply = botFatherMenuReply()
+	}
+	s.sendServiceBotReply(ctx, domain.BotFatherUserID, userID, reply)
+	return domain.BotCallbackAnswer{}, true, nil
 }
 
 type ownedBot struct {

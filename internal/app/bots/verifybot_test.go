@@ -869,13 +869,13 @@ func TestVerifyBotCallbackForForeignBotIsNotClaimed(t *testing.T) {
 	}); handled || err != nil {
 		t.Fatalf("foreign bot callback handled=%v err=%v, want (false, nil)", handled, err)
 	}
-	// A built-in bot with no keyboards is claimed but answered empty, so the click
-	// cannot hang for the whole callback timeout.
+	// BotFather owns an inline menu, so it claims its own callbacks and answers a
+	// stale button with an alert instead of silence.
 	answer, handled, err := svc.OnCallbackQuery(context.Background(), domain.BotCallbackQuery{
 		BotUserID: domain.BotFatherUserID, UserID: 900, Data: []byte("x"),
 	})
-	if !handled || err != nil || answer.Message != "" {
-		t.Fatalf("BotFather callback = (%+v, %v, %v)", answer, handled, err)
+	if !handled || err != nil || answer.Message == "" || !answer.Alert {
+		t.Fatalf("BotFather callback = (%+v, %v, %v), want a claimed stale-button alert", answer, handled, err)
 	}
 }
 

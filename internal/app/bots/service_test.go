@@ -69,8 +69,12 @@ func TestBotFatherNewBotFlow(t *testing.T) {
 	owner := newOwner(t, users, "+1000")
 	ctx := context.Background()
 
-	if reply := sendToBotFather(t, svc, messages, owner, "/start"); !strings.Contains(reply, "/newbot") {
-		t.Fatalf("/start reply = %q, want help text", reply)
+	// /start opens the button menu; the command reference lives behind /help.
+	if reply := sendToBotFather(t, svc, messages, owner, "/start"); !strings.Contains(reply, "Pick an action") {
+		t.Fatalf("/start reply = %q, want the menu prompt", reply)
+	}
+	if reply := sendToBotFather(t, svc, messages, owner, "/help"); !strings.Contains(reply, "/newbot") {
+		t.Fatalf("/help reply = %q, want help text", reply)
 	}
 	if reply := sendToBotFather(t, svc, messages, owner, "/newbot"); !strings.Contains(reply, "choose a name") {
 		t.Fatalf("/newbot reply = %q, want name prompt", reply)
@@ -339,8 +343,14 @@ func TestBotFatherMyBotsAndLimit(t *testing.T) {
 			t.Fatalf("create bot %d: %v", i, err)
 		}
 	}
-	if reply := sendToBotFather(t, svc, messages, owner, "/mybots"); !strings.Contains(reply, "@limit0_bot") {
-		t.Fatalf("/mybots reply = %q, want bot list", reply)
+	// The list is a set of inline buttons now, one per bot, not a text list.
+	listReply := latestBotFatherMessage(t, svc, messages, owner, "/mybots")
+	if !strings.Contains(listReply.Body, "Your bots") {
+		t.Fatalf("/mybots reply = %q, want the list header", listReply.Body)
+	}
+	labels := botFatherInlineButtonTexts(t, listReply)
+	if len(labels) == 0 || labels[0] != "@limit0_bot" {
+		t.Fatalf("/mybots buttons = %v, want @limit0_bot first", labels)
 	}
 	if _, _, err := svc.CreateBot(ctx, owner.ID, "One Too Many", "toomany_bot"); err != domain.ErrBotsTooMany {
 		t.Fatalf("create over limit err = %v, want ErrBotsTooMany", err)

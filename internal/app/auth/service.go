@@ -82,18 +82,22 @@ func systemLoginPhoneForbidden(phone string) bool {
 // External delivery for existing accounts is an additional channel to the durable 777000 App-code and must
 // not replace or weaken the original message fact.
 type Service struct {
-	users              store.UserStore
-	auths              store.AuthorizationStore
-	codes              store.CodeStore
-	authKeys           store.AuthKeyStore
-	tempKeys           store.TempAuthKeyBindingStore
-	passwords          store.PasswordStore
-	messages           store.MessageStore
-	dialogs            store.DialogStore
-	loginCodeDelivery  store.LoginCodeDeliveryStore
-	loginCodeTemplate  func() (string, error)
-	bots               store.BotStore
-	fixedCode          string
+	users             store.UserStore
+	auths             store.AuthorizationStore
+	codes             store.CodeStore
+	authKeys          store.AuthKeyStore
+	tempKeys          store.TempAuthKeyBindingStore
+	passwords         store.PasswordStore
+	messages          store.MessageStore
+	dialogs           store.DialogStore
+	loginCodeDelivery store.LoginCodeDeliveryStore
+	loginCodeTemplate func() (string, error)
+	bots              store.BotStore
+	fixedCode         string
+	// randomLoginCodes makes createPhoneCode ignore fixedCode. A production
+	// build sets it: every login code is then a fresh secret, delivered through
+	// the 777000 message or revealed by a flash call.
+	randomLoginCodes   bool
 	codeTTL            time.Duration
 	codeMaxAttempts    int
 	loginEmails        loginEmailStore
@@ -245,6 +249,20 @@ func WithBotLogin(bots store.BotStore) Option {
 func WithPremiumGrant(months int) Option {
 	return func(s *Service) {
 		s.premiumGrantMonths = months
+	}
+}
+
+// WithRandomLoginCodes makes every login code a fresh random value instead of
+// the configured development code.
+//
+// Production needs it: the fixed code is the same for every account, so it is
+// not a secret at all once a code can be delivered (a 777000 message to the
+// account's devices) or revealed (a flash call). The development code stays
+// available for a build with no delivery channel, where a typeable constant is
+// the only way to finish a login.
+func WithRandomLoginCodes() Option {
+	return func(s *Service) {
+		s.randomLoginCodes = true
 	}
 }
 
@@ -545,15 +563,18 @@ func (s *Service) createPhoneCode(ctx context.Context, phone string, existingUse
 	if err != nil {
 		return "", err
 	}
-	// A number on the flash-call channel always gets a real random code: the
-	// same value is revealed by the call, so the fixed development code would
-	// leak the secret. Outside that channel the fixed code is kept, because the
-	// phone-change flow relies on the same configured value and a build without
-	// any delivery channel still needs a code a tester can type.
+	// Login codes are random in production: a fixed code is not a login secret,
+	// it is the same value for every account, it is what a flash call reveals
+	// and what a 777000 message carries. Builds without any delivery channel
+	// (and the test fixtures that stand in for them) keep the configured code,
+	// which is what makes a code typeable when nothing can send one.
+	// The change-phone flow keeps its configured code in
+	// recreateChangePhoneCode for the same reason: that code goes to a number
+	// that has no account and therefore no channel.
 	code := s.fixedCode
 	channel := codeChannelPhone
 	deliveryID := ""
-	if s.phoneCodeSender != nil || code == "" || s.flashcallAppliesTo(phone) {
+	if s.randomLoginCodes || s.phoneCodeSender != nil || code == "" || s.flashcallAppliesTo(phone) {
 		code, err = randomDigits(s.phoneCodeLength)
 		if err != nil {
 			return "", err

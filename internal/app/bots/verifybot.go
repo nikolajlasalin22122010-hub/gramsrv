@@ -365,6 +365,10 @@ func (s *Service) OnCallbackQuery(ctx context.Context, query domain.BotCallbackQ
 	if s.premium != nil && query.BotUserID == s.premium.BotUserID() {
 		return s.onPremiumCallback(ctx, query)
 	}
+	if query.BotUserID == domain.BotFatherUserID {
+		// BotFather drives its whole menu from inline buttons (botfather.go).
+		return s.onBotFatherCallback(ctx, query)
+	}
 	if query.BotUserID != domain.VerifyBotUserID {
 		// The other built-in bots never attach an inline keyboard, so there is
 		// nothing to route. An empty answer still beats hanging the click for the

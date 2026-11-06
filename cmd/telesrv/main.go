@@ -1791,6 +1791,11 @@ func run(logger *zap.Logger) error {
 		auth.WithPasswords(passwordStore),
 		auth.WithBotLogin(botStore),
 		auth.WithPremiumGrant(cfg.PremiumGrantMonths),
+		// Every login code is a fresh random value: it travels to the account's
+		// other devices as a 777000 message and is revealed by a flash call on
+		// the configured prefixes. The fixed development code would make both
+		// channels pointless.
+		auth.WithRandomLoginCodes(),
 		auth.WithPremiumGrantDays(cfg.PremiumGrantDays),
 		// Signup premium must land in premium_entitlements, not just in
 		// users.premium_expires_at: @premiumbot and the purchase/refund paths

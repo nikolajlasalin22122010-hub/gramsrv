@@ -70,7 +70,34 @@ func newFlashcallService(t *testing.T, codes *memory.CodeStore, registry Flashca
 	return NewService(memory.NewUserStore(), memory.NewAuthorizationStore(), codes, nil, nil, "12345",
 		WithFlashcallPrefixes([]string{"+7"}),
 		WithFlashcallCodeRegistry(registry),
+		// Production behaviour: the fixed code is configured but never used for
+		// a login, because both delivery channels carry a real code.
+		WithRandomLoginCodes(),
 	)
+}
+
+// WithRandomLoginCodes is what makes a delivered code a secret: outside the
+// flash-call prefixes the configured development code must not survive either.
+func TestRandomLoginCodesIgnoreFixedCode(t *testing.T) {
+	ctx := context.Background()
+	codes := memory.NewCodeStore()
+	svc := NewService(memory.NewUserStore(), memory.NewAuthorizationStore(), codes, nil, nil, "12345",
+		WithRandomLoginCodes())
+
+	hash, err := svc.SendCode(ctx, "+4915112345678")
+	if err != nil {
+		t.Fatalf("SendCode: %v", err)
+	}
+	rec, found, err := codes.Get(ctx, hash)
+	if err != nil || !found {
+		t.Fatalf("code record not stored: %v", err)
+	}
+	if rec.Code == "12345" {
+		t.Fatalf("random login codes still produced the development code")
+	}
+	if len(rec.Code) != 5 {
+		t.Fatalf("code length = %d, want 5", len(rec.Code))
+	}
 }
 
 // A flash-call number still gets a real random code: the code is the secret both
