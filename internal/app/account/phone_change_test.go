@@ -297,3 +297,73 @@ func TestPhoneChangeConcurrentReplayChangesOnceWithoutPTSEvent(t *testing.T) {
 		t.Fatalf("events = %+v err=%v", events, err)
 	}
 }
+
+// recordingFlashcallRegistry captures the phone -> hash bindings the phone
+// change flow publishes for the flash-call channel.
+type recordingFlashcallRegistry struct {
+	binds []flashcallBind
+}
+
+type flashcallBind struct {
+	phone string
+	hash  string
+	ttl   time.Duration
+}
+
+func (r *recordingFlashcallRegistry) Bind(_ context.Context, phone, hash string, ttl time.Duration) error {
+	r.binds = append(r.binds, flashcallBind{phone: phone, hash: hash, ttl: ttl})
+	return nil
+}
+
+// TestPhoneChangeFlashcallRandomizesCodeAndBindsHash covers the prefix that may
+// be verified by a call: the configured constant must not survive, and the hash
+// must be published so the flash-call API can reveal the value.
+func TestPhoneChangeFlashcallRandomizesCodeAndBindsHash(t *testing.T) {
+	f := newPhoneChangeFixture(t)
+	registry := &recordingFlashcallRegistry{}
+	f.service.phoneChangeFlashcall = registry
+	f.service.phoneChangeFlashPrefixes = []string{"7"}
+
+	hash, _, err := f.service.SendChangePhoneCode(f.ctx, f.user.ID, f.authKeyID, 77, "79161234567")
+	if err != nil {
+		t.Fatalf("SendChangePhoneCode: %v", err)
+	}
+	rec, found, err := f.codes.Get(f.ctx, hash)
+	if err != nil || !found {
+		t.Fatalf("record found=%v err=%v", found, err)
+	}
+	if rec.Code == "12345" {
+		t.Fatal("change-phone code is still the configured constant")
+	}
+	if len(rec.Code) != 5 {
+		t.Fatalf("code length = %d, want 5", len(rec.Code))
+	}
+	if len(registry.binds) != 1 || registry.binds[0].hash != hash || registry.binds[0].ttl <= 0 {
+		t.Fatalf("flashcall binds = %+v", registry.binds)
+	}
+}
+
+// TestPhoneChangeOutsidePrefixKeepsConfiguredCode pins the documented fallback:
+// a number no channel can reach keeps the typeable configured value, otherwise
+// the flow would be impossible to finish at all.
+func TestPhoneChangeOutsidePrefixKeepsConfiguredCode(t *testing.T) {
+	f := newPhoneChangeFixture(t)
+	registry := &recordingFlashcallRegistry{}
+	f.service.phoneChangeFlashcall = registry
+	f.service.phoneChangeFlashPrefixes = []string{"7"}
+
+	hash, _, err := f.service.SendChangePhoneCode(f.ctx, f.user.ID, f.authKeyID, 77, "15550012030")
+	if err != nil {
+		t.Fatalf("SendChangePhoneCode: %v", err)
+	}
+	rec, found, err := f.codes.Get(f.ctx, hash)
+	if err != nil || !found {
+		t.Fatalf("record found=%v err=%v", found, err)
+	}
+	if rec.Code != "12345" {
+		t.Fatalf("code = %q, want the configured constant", rec.Code)
+	}
+	if len(registry.binds) != 0 {
+		t.Fatalf("unexpected flashcall binds: %+v", registry.binds)
+	}
+}

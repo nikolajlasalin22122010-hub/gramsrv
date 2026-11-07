@@ -1208,6 +1208,18 @@ func run(logger *zap.Logger) error {
 	// first_name/bot_info_version within the TTL.
 	userCache := redisstore.NewUserCache(rdb, redisstore.DefaultUserCacheTTL)
 	accountLifecycleStore := postgres.NewAccountLifecycleStore(pool)
+	// The flash-call registry and prefixes are shared by login and by the
+	// phone-change flow: both issue codes a caller may reveal by calling.
+	var flashcallRegistry *redisstore.FlashcallCodeRegistry
+	var flashCallPrefixes []string
+	if cfg.FlashCallToken != "" {
+		flashcallRegistry = redisstore.NewFlashcallCodeRegistry(rdb)
+		for _, part := range strings.Split(cfg.FlashCallPrefixes, ",") {
+			if part = strings.TrimSpace(part); part != "" {
+				flashCallPrefixes = append(flashCallPrefixes, part)
+			}
+		}
+	}
 	accountOptions := []account.ServiceOption{
 		account.WithReactionSettings(passwordStore),
 		account.WithAccountSettings(passwordStore),
@@ -1221,6 +1233,10 @@ func run(logger *zap.Logger) error {
 		account.WithAccountLifecycle(accountLifecycleStore),
 		account.WithTmpPasswords(postgres.NewTmpPasswordStore(pool), authzStore),
 		account.WithPublicBaseURL(cfg.PublicBaseURL),
+	}
+	if flashcallRegistry != nil {
+		accountOptions = append(accountOptions,
+			account.WithPhoneChangeFlashcall(flashcallRegistry, flashCallPrefixes))
 	}
 	var webhookSender otpdelivery.Sender
 	if cfg.PhoneCodeDeliveryProvider == "webhook" ||
@@ -1761,15 +1777,9 @@ func run(logger *zap.Logger) error {
 	// prove ownership with a call instead. Numbers outside the prefixes are
 	// unaffected.
 	var flashCallAuthOptions []auth.Option
-	if cfg.FlashCallToken != "" {
+	if flashcallRegistry != nil {
 		flashCallAuthOptions = append(flashCallAuthOptions,
-			auth.WithFlashcallCodeRegistry(redisstore.NewFlashcallCodeRegistry(rdb)))
-		var flashCallPrefixes []string
-		for _, part := range strings.Split(cfg.FlashCallPrefixes, ",") {
-			if part = strings.TrimSpace(part); part != "" {
-				flashCallPrefixes = append(flashCallPrefixes, part)
-			}
-		}
+			auth.WithFlashcallCodeRegistry(flashcallRegistry))
 		if len(flashCallPrefixes) > 0 {
 			flashCallAuthOptions = append(flashCallAuthOptions,
 				auth.WithFlashcallPrefixes(flashCallPrefixes))

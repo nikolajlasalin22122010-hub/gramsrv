@@ -909,14 +909,22 @@ func (s *Service) recreateChangePhoneCode(ctx context.Context, rec store.PhoneCo
 	if err != nil {
 		return "", err
 	}
+	// A fixed code is not a secret, so the resend follows the same rule as
+	// createPhoneCode: randomize whenever a channel can carry the value -- a
+	// flash call on the configured prefixes, an SMS provider, or the production
+	// random-code mode. The configured constant survives only for a build with
+	// no delivery channel at all, where a typeable value is the only way to
+	// finish the flow.
 	rec.Code = s.fixedCode
 	rec.DeliveryID = ""
 	rec.Channel = codeChannelPhone
-	if s.phoneCodeSender != nil {
+	if s.randomLoginCodes || s.phoneCodeSender != nil || s.fixedCode == "" || s.flashcallAppliesTo(rec.Phone) {
 		rec.Code, err = randomDigits(s.phoneCodeLength)
 		if err != nil {
 			return "", err
 		}
+	}
+	if s.phoneCodeSender != nil {
 		rec.DeliveryID, err = otpdelivery.NewDeliveryID()
 		if err != nil {
 			return "", err
@@ -931,6 +939,9 @@ func (s *Service) recreateChangePhoneCode(ctx context.Context, rec store.PhoneCo
 	if err := s.codes.Set(ctx, hash, rec, s.codeTTL); err != nil {
 		return "", fmt.Errorf("store resent phone change code: %w", err)
 	}
+	// Publish phone -> hash so a flash call can reveal the resent code for the
+	// configured prefixes, the same way a login code is published.
+	s.bindFlashcallCode(ctx, rec.Phone, hash)
 	if s.phoneCodeSender != nil {
 		if err := deliverOTP(ctx, s.phoneCodeSender, otpdelivery.Request{
 			DeliveryID: rec.DeliveryID,

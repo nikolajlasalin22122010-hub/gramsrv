@@ -59,6 +59,8 @@ type Service struct {
 	loginEmailSender          otpdelivery.Sender
 	phoneCodeSender           otpdelivery.Sender
 	phoneCodeLength           int
+	phoneChangeFlashcall      PhoneChangeFlashcallRegistry
+	phoneChangeFlashPrefixes  []string
 	loginEmailCodeTTL         time.Duration
 	loginEmailCodeMaxAttempts int
 	loginEmailCodeLength      int
@@ -139,6 +141,59 @@ func WithPhoneChange(phoneChanges store.PhoneChangeStore, authorizations store.A
 			s.phoneChangeMaxAttempts = maxAttempts
 		}
 	}
+}
+
+// PhoneChangeFlashcallRegistry publishes a phone -> code-hash binding so the
+// flash-call API can reveal a change-phone code from the number alone. It is
+// structurally identical to auth.FlashcallCodeRegistry, which is what the
+// server wires in.
+type PhoneChangeFlashcallRegistry interface {
+	Bind(ctx context.Context, phone, hash string, ttl time.Duration) error
+}
+
+// WithPhoneChangeFlashcall makes the flash-call channel available to the
+// phone-change and confirm-phone codes for the listed E.164 prefixes.
+func WithPhoneChangeFlashcall(registry PhoneChangeFlashcallRegistry, prefixes []string) ServiceOption {
+	return func(s *Service) {
+		s.phoneChangeFlashcall = registry
+		s.phoneChangeFlashPrefixes = prefixes
+	}
+}
+
+// phoneChangeFlashcallAppliesTo reports whether phone belongs to a prefix that
+// may be verified by a flash call.
+func (s *Service) phoneChangeFlashcallAppliesTo(phone string) bool {
+	if s == nil || s.phoneChangeFlashcall == nil || len(s.phoneChangeFlashPrefixes) == 0 {
+		return false
+	}
+	for _, prefix := range s.phoneChangeFlashPrefixes {
+		if strings.HasPrefix(phone, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// phoneChangeCodeLength falls back to the login default when no SMS provider
+// configured a length, which is the case on a flash-call-only deployment.
+func (s *Service) phoneChangeCodeLength() int {
+	if s.phoneCodeLength > 0 {
+		return s.phoneCodeLength
+	}
+	return 5
+}
+
+// bindPhoneChangeFlashcall is best effort: the flash call is a second channel,
+// never the only durable state, so a failed bind only costs this one attempt.
+func (s *Service) bindPhoneChangeFlashcall(ctx context.Context, phone, hash string) {
+	if !s.phoneChangeFlashcallAppliesTo(phone) {
+		return
+	}
+	ttl := s.phoneChangeCodeTTL
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	_ = s.phoneChangeFlashcall.Bind(ctx, phone, hash, ttl)
 }
 
 func WithPublicBaseURL(baseURL string) ServiceOption {

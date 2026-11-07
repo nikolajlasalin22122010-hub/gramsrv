@@ -195,14 +195,18 @@ func (s *Service) issueConfirmPhoneCode(ctx context.Context, userID int64, authK
 	if err != nil {
 		return "", domain.AuthCodeDelivery{}, err
 	}
+	// Same rule as SendChangePhoneCode: randomize as soon as a channel can
+	// carry the value, keep the constant only for a channel-less build.
 	code := s.phoneChangeCode
 	channel := store.PhoneCodeChannelPhone
 	deliveryID := ""
-	if s.phoneCodeSender != nil {
-		code, err = randomDigits(s.phoneCodeLength)
+	if s.phoneCodeSender != nil || s.phoneChangeFlashcallAppliesTo(phone) || strings.TrimSpace(s.phoneChangeCode) == "" {
+		code, err = randomDigits(s.phoneChangeCodeLength())
 		if err != nil {
 			return "", domain.AuthCodeDelivery{}, err
 		}
+	}
+	if s.phoneCodeSender != nil {
 		deliveryID, err = otpdelivery.NewDeliveryID()
 		if err != nil {
 			return "", domain.AuthCodeDelivery{}, err
@@ -229,6 +233,7 @@ func (s *Service) issueConfirmPhoneCode(ctx context.Context, userID int64, authK
 	if err := s.codes.Set(ctx, hash, rec, s.phoneChangeCodeTTL); err != nil {
 		return "", domain.AuthCodeDelivery{}, fmt.Errorf("store confirm phone code: %w", err)
 	}
+	s.bindPhoneChangeFlashcall(ctx, phone, hash)
 	if s.phoneCodeSender != nil {
 		if err := deliverOTP(ctx, s.phoneCodeSender, otpdelivery.Request{
 			DeliveryID: deliveryID,
