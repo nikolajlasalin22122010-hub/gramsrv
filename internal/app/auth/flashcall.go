@@ -61,6 +61,111 @@ func WithFlashcallCodeRegistry(registry FlashcallCodeRegistry) Option {
 	return func(s *Service) { s.flashcallRegistry = registry }
 }
 
+// FlashCallSession is a pending call request: the owner of the phone has to
+// dial Number before ExpiresIn seconds elapse.
+type FlashCallSession struct {
+	ID        string
+	Number    string
+	ExpiresIn int
+}
+
+// FlashCallStatus is the provider's view of a call request.
+type FlashCallStatus struct {
+	ID          string
+	Status      string
+	CallerPhone string
+	ExpiresIn   int
+}
+
+// FlashCallProvider is the outbound boundary to a flash-call verification
+// service. It never sees login codes: it only proves that the owner of a phone
+// number dialed a number the provider controls.
+type FlashCallProvider interface {
+	GetPhone(ctx context.Context, phone string) (FlashCallSession, error)
+	Status(ctx context.Context, id string) (FlashCallStatus, error)
+}
+
+// flashCallStatusConfirmed is the provider state that means the caller proved
+// ownership by placing the call.
+const flashCallStatusConfirmed = "CONFIRMED"
+
+// flashCallSession remembers which provider request belongs to a login hash.
+type flashCallSession struct {
+	id        string
+	expiresAt time.Time
+}
+
+// WithFlashCallProvider wires the outbound flash-call provider. Together with
+// the prefixes it turns the flash call into a login channel of its own rather
+// than just a second way to reveal the App code.
+func WithFlashCallProvider(provider FlashCallProvider) Option {
+	return func(s *Service) {
+		s.flashCallProvider = provider
+		if s.flashCallSessions == nil {
+			s.flashCallSessions = make(map[string]flashCallSession)
+		}
+	}
+}
+
+// FlashCallNumber opens a call request for a phone that just received a login
+// code and returns the number the caller has to dial.
+//
+// ok is false whenever the number is outside the configured prefixes, no
+// provider is wired, or the provider refuses the number: the caller then keeps
+// the ordinary App-code delivery, so a provider outage never blocks a login.
+func (s *Service) FlashCallNumber(ctx context.Context, phone, hash string) (string, bool) {
+	phone = normalizePhone(phone)
+	if s == nil || s.flashCallProvider == nil || !s.flashcallAppliesTo(phone) {
+		return "", false
+	}
+	session, err := s.flashCallProvider.GetPhone(ctx, phone)
+	if err != nil || strings.TrimSpace(session.Number) == "" {
+		return "", false
+	}
+	ttl := s.codeTTL
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	s.flashCallMu.Lock()
+	if s.flashCallSessions == nil {
+		s.flashCallSessions = make(map[string]flashCallSession)
+	}
+	s.flashCallSessions[hash] = flashCallSession{id: session.ID, expiresAt: time.Now().Add(ttl)}
+	s.flashCallMu.Unlock()
+	return session.Number, true
+}
+
+// flashCallApprovedCode returns the login code pending for hash once the owner
+// of phone has proven ownership with a call.
+//
+// The provider is polled at most once per signIn: the client retries while the
+// user is still on the call, so a signIn that lands right after the call still
+// succeeds without waiting for a webhook.
+func (s *Service) flashCallApprovedCode(ctx context.Context, phone, hash string) (string, bool) {
+	if s == nil || s.flashCallProvider == nil || s.flashcallRegistry == nil || !s.flashcallAppliesTo(phone) {
+		return "", false
+	}
+	rec, found, err := s.codes.Get(ctx, hash)
+	if err != nil || !found || rec.Phone != phone {
+		return "", false
+	}
+	if ok, err := s.flashcallRegistry.Confirmed(ctx, phone, hash); err == nil && ok {
+		return rec.Code, true
+	}
+	s.flashCallMu.Lock()
+	session, has := s.flashCallSessions[hash]
+	s.flashCallMu.Unlock()
+	if !has || time.Now().After(session.expiresAt) {
+		return "", false
+	}
+	status, err := s.flashCallProvider.Status(ctx, session.id)
+	if err != nil || status.Status != flashCallStatusConfirmed {
+		return "", false
+	}
+	_ = s.flashcallRegistry.Confirm(ctx, phone, hash)
+	return rec.Code, true
+}
+
 // flashcallAppliesTo reports whether phone belongs to a prefix that may also be
 // verified by a flash call.
 func (s *Service) flashcallAppliesTo(phone string) bool {

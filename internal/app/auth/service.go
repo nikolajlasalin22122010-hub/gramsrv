@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -110,7 +111,12 @@ type Service struct {
 	flashcallPrefixes []string
 	// flashcallRegistry is the phone->hash index backing that gate. Nil keeps
 	// the feature off entirely.
-	flashcallRegistry      FlashcallCodeRegistry
+	flashcallRegistry FlashcallCodeRegistry
+	// flashCallProvider issues and polls the outbound call requests. Nil keeps
+	// the MTProto surface on the App-code delivery only.
+	flashCallProvider      FlashCallProvider
+	flashCallMu            sync.Mutex
+	flashCallSessions      map[string]flashCallSession
 	loginEmailEnabled      bool
 	loginEmailRequireSetup bool
 	loginEmailCodeLength   int
@@ -1106,6 +1112,13 @@ func (s *Service) SignIn(ctx context.Context, auth domain.Authorization, phone, 
 	phone = normalizePhone(phone)
 	if systemLoginPhoneForbidden(phone) {
 		return domain.User{}, domain.Message{}, false, ErrSystemUserLoginForbidden
+	}
+	// A confirmed flash call is proof of ownership on its own: the client sends
+	// an empty code and the call the user just placed stands in for it.
+	if strings.TrimSpace(code) == "" {
+		if approved, ok := s.flashCallApprovedCode(ctx, phone, phoneCodeHash); ok {
+			code = approved
+		}
 	}
 	_, existing, found, err := s.verifyLoginCode(ctx, phone, phoneCodeHash, code)
 	if err != nil {

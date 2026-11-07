@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"telesrv/internal/domain"
 	"telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
@@ -243,5 +244,72 @@ func TestFlashcallPrefixMatching(t *testing.T) {
 	}
 	if (&Service{}).flashcallAppliesTo(normalizePhone("+79161234567")) {
 		t.Errorf("an unconfigured service must not expose the channel")
+	}
+}
+
+// fakeFlashCallProvider stands in for flashcall.ru: it hands out one number and
+// reports whatever state the test sets.
+type fakeFlashCallProvider struct {
+	number string
+	status string
+}
+
+func (p *fakeFlashCallProvider) GetPhone(context.Context, string) (FlashCallSession, error) {
+	return FlashCallSession{ID: "sess-1", Number: p.number, ExpiresIn: 60}, nil
+}
+
+func (p *fakeFlashCallProvider) Status(context.Context, string) (FlashCallStatus, error) {
+	return FlashCallStatus{ID: "sess-1", Status: p.status}, nil
+}
+
+// TestFlashCallNumberAndConfirmedSignIn covers variant A end to end: sendCode
+// exposes the number to dial, an empty code is rejected until the provider sees
+// the call, and the same empty code signs in once it does.
+func TestFlashCallNumberAndConfirmedSignIn(t *testing.T) {
+	ctx := context.Background()
+	codes := memory.NewCodeStore()
+	svc := newFlashcallService(t, codes, newMemFlashcallRegistry())
+	provider := &fakeFlashCallProvider{number: "+79990001122", status: "PENDING"}
+	svc.flashCallProvider = provider
+
+	hash, err := svc.SendCode(ctx, "+79161234567")
+	if err != nil {
+		t.Fatalf("SendCode: %v", err)
+	}
+
+	number, ok := svc.FlashCallNumber(ctx, "+79161234567", hash)
+	if !ok || number != "+79990001122" {
+		t.Fatalf("FlashCallNumber = %q, %v", number, ok)
+	}
+
+	if _, _, _, err := svc.SignIn(ctx, domain.Authorization{}, "+79161234567", hash, ""); err == nil {
+		t.Fatal("signIn accepted an empty code before the call was confirmed")
+	}
+
+	provider.status = "CONFIRMED"
+	_, _, needSignUp, err := svc.SignIn(ctx, domain.Authorization{}, "+79161234567", hash, "")
+	if err != nil {
+		t.Fatalf("signIn after confirmation: %v", err)
+	}
+	if !needSignUp {
+		t.Fatal("an unregistered number must still require sign-up after the call")
+	}
+}
+
+// TestFlashCallNumberSkipsForeignPrefix pins the fallback: outside the
+// configured prefixes no call is requested and the App code stays the only
+// channel.
+func TestFlashCallNumberSkipsForeignPrefix(t *testing.T) {
+	ctx := context.Background()
+	codes := memory.NewCodeStore()
+	svc := newFlashcallService(t, codes, newMemFlashcallRegistry())
+	svc.flashCallProvider = &fakeFlashCallProvider{number: "+79990001122", status: "PENDING"}
+
+	hash, err := svc.SendCode(ctx, "+4915112345678")
+	if err != nil {
+		t.Fatalf("SendCode: %v", err)
+	}
+	if number, ok := svc.FlashCallNumber(ctx, "+4915112345678", hash); ok || number != "" {
+		t.Fatalf("FlashCallNumber = %q, %v, want no call for a foreign prefix", number, ok)
 	}
 }

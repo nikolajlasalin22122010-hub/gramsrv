@@ -1783,6 +1783,11 @@ func run(logger *zap.Logger) error {
 		if len(flashCallPrefixes) > 0 {
 			flashCallAuthOptions = append(flashCallAuthOptions,
 				auth.WithFlashcallPrefixes(flashCallPrefixes))
+			// Same provider instance as the public web page: one HTTP client, one
+			// token, one set of provider-side rate limits.
+			flashCallAuthOptions = append(flashCallAuthOptions,
+				auth.WithFlashCallProvider(flashCallAdapter{provider: web.NewHTTPFlashCallProvider(
+					cfg.FlashCallAPIBase, cfg.FlashCallToken, cfg.FlashCallTimeout)}))
 			logger.Info("flashcall channel enabled", zap.Strings("prefixes", flashCallPrefixes))
 		}
 	}
@@ -2633,4 +2638,26 @@ func (p pgPaymentSettings) GetSetting(ctx context.Context, key string) (string, 
 		return "", err
 	}
 	return value, nil
+}
+
+// flashCallAdapter bridges the web package's flash-call provider to the auth
+// package's structural interface, so both surfaces share one HTTP client.
+type flashCallAdapter struct {
+	provider *web.HTTPFlashCallProvider
+}
+
+func (a flashCallAdapter) GetPhone(ctx context.Context, phone string) (auth.FlashCallSession, error) {
+	session, err := a.provider.GetPhone(ctx, phone)
+	if err != nil {
+		return auth.FlashCallSession{}, err
+	}
+	return auth.FlashCallSession{ID: session.ID, Number: session.Number, ExpiresIn: session.ExpiresIn}, nil
+}
+
+func (a flashCallAdapter) Status(ctx context.Context, id string) (auth.FlashCallStatus, error) {
+	status, err := a.provider.Status(ctx, id)
+	if err != nil {
+		return auth.FlashCallStatus{}, err
+	}
+	return auth.FlashCallStatus{ID: status.ID, Status: status.Status, CallerPhone: status.CallerPhone, ExpiresIn: status.ExpiresIn}, nil
 }

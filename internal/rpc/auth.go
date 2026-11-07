@@ -421,7 +421,7 @@ func (r *Router) onAuthSendCode(ctx context.Context, req *tg.AuthSendCodeRequest
 		r.log.Error("auth.sendCode failed", fields...)
 		return nil, internalErr()
 	}
-	sent, err := r.tgSentCodeForHash(ctx, hash)
+	sent, err := r.tgSentCodeForHash(ctx, hash, req.PhoneNumber)
 	if err != nil {
 		fields := append(r.contextLogFields(ctx), zap.Error(err))
 		r.log.Error("auth.sendCode delivery lookup failed", fields...)
@@ -519,7 +519,7 @@ func tgEmailSetupRequiredSentCode(hash string) tg.AuthSentCodeClass {
 	}
 }
 
-func (r *Router) tgSentCodeForHash(ctx context.Context, hash string) (tg.AuthSentCodeClass, error) {
+func (r *Router) tgSentCodeForHash(ctx context.Context, hash, phone string) (tg.AuthSentCodeClass, error) {
 	if r.deps.Auth == nil {
 		return tgSentCode(hash), nil
 	}
@@ -529,6 +529,19 @@ func (r *Router) tgSentCodeForHash(ctx context.Context, hash string) (tg.AuthSen
 	}
 	if !found {
 		return nil, signInErr(auth.ErrCodeExpired)
+	}
+	// Flash call: the same code is already issued and mirrored to 777000, but
+	// the client is told to dial a number instead of waiting for the message.
+	// A provider failure falls through to the ordinary delivery type.
+	if svc, ok := r.deps.Auth.(interface {
+		FlashCallNumber(context.Context, string, string) (string, bool)
+	}); ok {
+		if number, flash := svc.FlashCallNumber(ctx, phone, hash); flash {
+			return &tg.AuthSentCode{
+				Type:          &tg.AuthSentCodeTypeFlashCall{Pattern: number},
+				PhoneCodeHash: hash,
+			}, nil
+		}
 	}
 	switch delivery.Kind {
 	case domain.AuthCodeDeliverySMS:
@@ -614,7 +627,7 @@ func (r *Router) onAuthResendCode(ctx context.Context, req *tg.AuthResendCodeReq
 	if err != nil {
 		return nil, signInErr(err)
 	}
-	return r.tgSentCodeForHash(ctx, hash)
+	return r.tgSentCodeForHash(ctx, hash, req.PhoneNumber)
 }
 
 func (r *Router) onAuthCancelCode(ctx context.Context, req *tg.AuthCancelCodeRequest) (bool, error) {
@@ -822,7 +835,7 @@ func (r *Router) onAuthResetLoginEmail(ctx context.Context, req *tg.AuthResetLog
 		}
 		return nil, internalErr()
 	}
-	return r.tgSentCodeForHash(ctx, hash)
+	return r.tgSentCodeForHash(ctx, hash, req.PhoneNumber)
 }
 
 // emailVerificationCode extracts the verifiable string from an emailVerification (the verification

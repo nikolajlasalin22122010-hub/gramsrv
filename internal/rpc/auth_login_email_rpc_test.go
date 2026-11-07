@@ -30,7 +30,7 @@ func TestEmailSentCodeUsesDeliveryLength(t *testing.T) {
 	}
 	r := New(Config{}, Deps{Auth: authSvc}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000000, 0)})
 
-	sent, err := r.tgSentCodeForHash(context.Background(), "hash-email")
+	sent, err := r.tgSentCodeForHash(context.Background(), "hash-email", "")
 	if err != nil {
 		t.Fatalf("tgSentCodeForHash: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestEmailSentCodeAdvertisesResetOnlyWhenAvailable(t *testing.T) {
 				resetAvailable: tc.available,
 			}
 			r := New(Config{}, Deps{Auth: authSvc}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000000, 0)})
-			sent, err := r.tgSentCodeForHash(context.Background(), "hash-email-reset")
+			sent, err := r.tgSentCodeForHash(context.Background(), "hash-email-reset", "")
 			if err != nil {
 				t.Fatal(err)
 			}
